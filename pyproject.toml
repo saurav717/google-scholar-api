@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "scholar-api"
-version = "0.1.0"
+version = "0.2.0"
 description = "Self-hosted Google Scholar scraping API with SerpAPI-compatible JSON output"
 readme = "README.md"
 requires-python = ">=3.10"

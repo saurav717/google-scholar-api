@@ -52,10 +52,6 @@ def _int(text: Optional[str]) -> Optional[int]:
     return int(digits) if digits else None
 
 
-def _link(api_link: ApiLink, engine: str, **params) -> dict:
-    return {} if api_link is None else {"serpapi_link": api_link(engine, **params)}
-
-
 # --------------------------------------------------------------------------
 # Search results (engine=google_scholar)
 # --------------------------------------------------------------------------
@@ -66,11 +62,14 @@ def parse_search(html: str, api_link: ApiLink = None) -> dict:
     for position, node in enumerate(soup.select("div.gs_r.gs_or[data-cid]")):
         results.append(_parse_result(node, position, api_link))
 
-    return {
+    data = {
         "search_information": _parse_search_information(soup),
         "organic_results": results,
         "pagination": _parse_pagination(soup),
     }
+    data["search_information"].update(_parse_spelling(soup, api_link))
+    data["search_information"]["results_on_page"] = len(results)
+    return data
 
 
 def _parse_search_information(soup: BeautifulSoup) -> dict:
@@ -87,6 +86,28 @@ def _parse_search_information(soup: BeautifulSoup) -> dict:
     if query and query.get("value"):
         info["query_displayed"] = query["value"]
     return info
+
+
+def _parse_spelling(soup: BeautifulSoup, api_link: ApiLink) -> dict:
+    """'Did you mean: ...' and 'Showing results for ...' banners."""
+    out: dict = {}
+    for heading in soup.select("h2.gs_rt, .gs_r h2, #gs_res_ccl_top h2"):
+        text = _text(heading) or ""
+        anchor = heading.find("a")
+        if anchor is None:
+            continue
+        key = None
+        if text.lower().startswith("did you mean"):
+            key = "did_you_mean"
+        elif text.lower().startswith("showing results for"):
+            key = "showing_results_for"
+        if key and key not in out:
+            q = _qs(anchor.get("href"), "q")
+            entry = {"query": q or _text(anchor), "link": _abs(anchor.get("href"))}
+            if api_link and q:
+                entry["serpapi_link"] = api_link("google_scholar", q=q)
+            out[key] = entry
+    return out
 
 
 def _parse_result(node: Tag, position: int, api_link: ApiLink) -> dict:
@@ -146,7 +167,38 @@ def _parse_publication_info(pub: Tag, api_link: ApiLink) -> dict:
         authors.append(author)
     if authors:
         info["authors"] = authors
+    info.update(split_publication_summary(info["summary"] or ""))
     return info
+
+
+_YEAR = re.compile(r"(?:^|[\s,])((?:19|20)\d{2})$")
+
+
+def split_publication_summary(summary: str) -> dict:
+    """Split Scholar's grey line into its parts.
+
+    'A Vaswani, N Shazeer, N Parmar… - Advances in neural …, 2017 - proceedings.neurips.cc'
+      -> author_names, authors_truncated, venue, year, source
+    """
+    parts = [p.strip() for p in summary.split(" - ")]
+    if not parts or not parts[0]:
+        return {}
+    out: dict = {}
+    names = parts[0]
+    out["authors_truncated"] = names.endswith("…") or names.endswith("...")
+    out["author_names"] = [n.strip(" …") for n in names.rstrip("….").split(",") if n.strip(" …")]
+    rest = parts[1:]
+    if len(rest) >= 2 and re.fullmatch(r"[\w.-]+\.[a-z]{2,}", rest[-1]):
+        out["source"] = rest.pop()
+    middle = " - ".join(rest).strip()
+    if middle:
+        m = _YEAR.search(middle)
+        if m:
+            out["year"] = int(m.group(1))
+            middle = middle[: m.start(1)].rstrip(" ,")
+        if middle:
+            out["venue"] = middle
+    return out
 
 
 def _parse_inline_links(node: Tag, result_id: Optional[str], api_link: ApiLink) -> dict:
@@ -179,8 +231,12 @@ def _parse_inline_links(node: Tag, result_id: Optional[str], api_link: ApiLink) 
             if api_link:
                 versions["serpapi_scholar_link"] = api_link("google_scholar", cluster=cluster_id)
             links["versions"] = versions
+        elif "webofknowledge" in href or "webofscience" in href or text.startswith("Web of Science"):
+            links["web_of_science"] = {"total": _int(text), "link": _abs(href)}
         elif "scholar.googleusercontent.com" in href or "q=cache:" in href:
             links["cached_page_link"] = _abs(href)
+        elif "/scholar_url?" in href and text and "library" in text.lower():
+            links.setdefault("library_links", []).append({"title": text, "link": _abs(href)})
     return links
 
 
@@ -303,8 +359,42 @@ def parse_author(html: str, api_link: ApiLink = None) -> dict:
         "articles": articles,
         "cited_by": _parse_author_metrics(soup),
         "co_authors": _parse_co_authors(soup, api_link),
+        "public_access": _parse_public_access(soup),
         "more_articles": soup.select_one("#gsc_bpf_more:not([disabled])") is not None,
     }
+
+
+def _parse_public_access(soup: BeautifulSoup) -> Optional[dict]:
+    box = soup.select_one("#gsc_rsb_mnd")
+    if box is None:
+        return None
+    link = box.select_one("a[href*='view_op=list_mandates']") or box.select_one("a")
+    return {
+        "available": _int(_text(box.select_one(".gsc_rsb_m_a"))),
+        "not_available": _int(_text(box.select_one(".gsc_rsb_m_na"))),
+        "link": _abs(link.get("href")) if link is not None else None,
+    }
+
+
+def _bar_graph(container: Optional[Tag], year_cls: str, bar_cls: str, value_cls: str) -> list:
+    """Scholar's citations-per-year histograms.
+
+    Bars for zero-citation years are omitted; z-index counts back from the
+    most recent year (z-index:1 == last year shown).
+    """
+    if container is None:
+        return []
+    years = [_int(_text(s)) for s in container.select(f".{year_cls}")]
+    bars = container.select(f".{bar_cls}")
+    counts = {}
+    for i, bar in enumerate(bars):
+        z = re.search(r"z-index:\s*(\d+)", bar.get("style", ""))
+        idx = len(years) - int(z.group(1)) if z else None
+        if idx is None or not 0 <= idx < len(years):
+            idx = i if len(bars) == len(years) else None
+        if idx is not None:
+            counts[years[idx]] = _int(_text(bar.select_one(f".{value_cls}"))) or 0
+    return [{"year": y, "citations": counts.get(y, 0)} for y in years if y]
 
 
 def _parse_author_metrics(soup: BeautifulSoup) -> dict:
@@ -322,19 +412,7 @@ def _parse_author_metrics(soup: BeautifulSoup) -> dict:
         metric = re.sub(r"\W+", "_", name.lower()).strip("_")  # "h-index" -> "h_index"
         table.append({metric: dict(zip(keys, values))})
 
-    years = [_int(_text(s)) for s in soup.select(".gsc_md_hist_b .gsc_g_t")]
-    bars = soup.select(".gsc_md_hist_b .gsc_g_a")
-    counts = {}
-    for bar in bars:
-        # Bars for zero-citation years are omitted; z-index counts back from
-        # the most recent year (z-index:1 == last year shown).
-        z = re.search(r"z-index:\s*(\d+)", bar.get("style", ""))
-        idx = len(years) - int(z.group(1)) if z else None
-        if idx is None or not 0 <= idx < len(years):
-            idx = bars.index(bar) if len(bars) == len(years) else None
-        if idx is not None:
-            counts[years[idx]] = _int(_text(bar.select_one(".gsc_g_al"))) or 0
-    graph = [{"year": y, "citations": counts.get(y, 0)} for y in years if y]
+    graph = _bar_graph(soup.select_one(".gsc_md_hist_b"), "gsc_g_t", "gsc_g_a", "gsc_g_al")
     return {"table": table, "graph": graph}
 
 
@@ -394,6 +472,10 @@ def parse_citation(html: str) -> dict:
                 "value": _int(_text(cites)) if cites else None,
                 "link": _abs(cites.get("href")) if cites else None,
                 "cites_id": _qs(cites.get("href"), "cites") if cites else None,
+                "graph": _bar_graph(
+                    value_node.select_one("#gsc_oci_graph_bars") or soup.select_one("#gsc_oci_graph_bars"),
+                    "gsc_oci_g_t", "gsc_oci_g_a", "gsc_oci_g_al",
+                ),
             }
         elif key == "scholar_articles":
             citation[key] = [
@@ -455,6 +537,47 @@ def parse_profiles(html: str, api_link: ApiLink = None) -> dict:
         if token:
             pagination[f"{key}_page_token"] = token
     return {"profiles": profiles, "pagination": pagination}
+
+
+# --------------------------------------------------------------------------
+# BibTeX (the file behind the cite popup's "BibTeX" link)
+# --------------------------------------------------------------------------
+
+def parse_bibtex(text: str) -> Optional[dict]:
+    """Parse a single BibTeX entry into {type, key, fields}. Returns None if
+    ``text`` doesn't look like BibTeX."""
+    m = re.match(r"\s*@(\w+)\s*\{\s*([^,\s]*)\s*,", text)
+    if not m:
+        return None
+    entry = {"type": m.group(1).lower(), "key": m.group(2), "fields": {}}
+    i, n = m.end(), len(text)
+    while i < n:
+        fm = re.compile(r"\s*(\w+)\s*=\s*").match(text, i)
+        if not fm:
+            break
+        name, i = fm.group(1).lower(), fm.end()
+        if i < n and text[i] in "{\"":
+            close = "}" if text[i] == "{" else "\""
+            depth, j = 0, i
+            while j < n:
+                c = text[j]
+                if c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                if (close == "}" and depth == 0 and c == "}") or (close == '"' and j > i and c == '"' and depth == 0):
+                    break
+                j += 1
+            value, i = text[i + 1 : j], j + 1
+        else:
+            vm = re.compile(r"[^,}\s]+").match(text, i)
+            value, i = (vm.group(0), vm.end()) if vm else ("", i)
+        entry["fields"][name] = re.sub(r"\s+", " ", value.replace("{", "").replace("}", "")).strip()
+        cm = re.compile(r"\s*,?").match(text, i)
+        i = cm.end()
+    if "author" in entry["fields"]:
+        entry["authors"] = [a.strip() for a in entry["fields"]["author"].split(" and ") if a.strip()]
+    return entry
 
 
 # --------------------------------------------------------------------------
