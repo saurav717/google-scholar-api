@@ -172,6 +172,11 @@ async def run_check(query: str, author_id: str, profile_query: str, save_dir: Pa
         print(f"Could not read browser cookies: {session['browser_import_error']}")
     if session["ignored_browser_cookies"]:
         print(f"Ignored {len(session['ignored_browser_cookies'])} other Google cookies (sign-in etc.); never used or saved.")
+    captcha = client.stats()["captcha"]
+    if captcha["enabled"]:
+        print(f"CAPTCHA solver: {captcha['provider']}, {captcha['solved']} solved, {captcha['failed']} failed, "
+              f"{captcha['rejected_by_google']} rejected by Google"
+              + (f" (last error: {captcha['last_error']})" if captcha["last_error"] else ""))
     print(f"{total_pass} required fields ok, {total_fail} missing/failed.")
     print(f"Raw HTML and JSON saved in {save_dir.resolve()}")
     if total_fail:
