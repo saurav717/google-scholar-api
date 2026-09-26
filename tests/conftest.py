@@ -26,6 +26,8 @@ class FakeScholar:
         if self.blocked:
             return httpx.Response(200, text=fixture("captcha.html"))
         p = request.url.params
+        if request.url.path == "/scholar.bib":
+            return httpx.Response(200, text=fixture("bibtex.bib"))
         if request.url.path == "/scholar":
             name = "cite.html" if p.get("output") == "cite" else "search.html"
         elif p.get("view_op") == "view_citation":

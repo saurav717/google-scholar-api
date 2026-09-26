@@ -1,36 +1,165 @@
 # scholar-api
 
-A self-hosted Google Scholar scraper with a **SerpAPI-compatible JSON API**. It gives you
-the same response shape as SerpAPI's Google Scholar engines, so client code written for
-SerpAPI mostly just needs a new base URL.
+A self-hosted Google Scholar scraper with a **SerpAPI-compatible JSON API**. It returns
+the same response shape as SerpAPI's Google Scholar engines, plus extra structured fields
+and diagnostics. Client code written for SerpAPI mostly just needs a new base URL.
 
-| Engine | What it returns | Main params |
-|---|---|---|
-| `google_scholar` (default) | Search results, "cited by" lists, all versions of a paper | `q`, `cites`, `cluster`, `as_ylo`, `as_yhi`, `scisbd`, `hl`, `lr`, `start`, `num` (≤20), `as_sdt`, `safe`, `filter`, `as_vis`, `as_rr` |
-| `google_scholar_cite` | MLA/APA/… citations and BibTeX/EndNote/RefMan links | `q` = a result's `result_id` |
-| `google_scholar_author` | Profile, metrics table, citation graph, articles, co-authors | `author_id`, `sort` (`title`/`pubdate`), `start`, `num` (≤100); or `view_op=view_citation&citation_id=…` |
-| `google_scholar_profiles` | Author search | `mauthors`, `after_author`, `before_author` |
+| Engine | What it returns |
+|---|---|
+| `google_scholar` (default) | Search results, papers citing a paper (`cites`), all versions of a paper (`cluster`) |
+| `google_scholar_cite` | MLA/APA/Chicago/Harvard/Vancouver citations, export links, and optionally the parsed BibTeX |
+| `google_scholar_author` | Profile, citation metrics, citations per year, public-access stats, co-authors, articles (optionally all of them), or one article's full record |
+| `google_scholar_profiles` | Author search by name or `label:<interest>` |
 
-Other params: `no_cache=true` skips the cache, and `api_key` is required only if you set `SCHOLAR_API_KEY`.
+---
 
-## Run
+## 1. Install
+
+Requires Python 3.10+.
 
 ```bash
+git clone https://github.com/saurav717/google-scholar-api.git
+cd google-scholar-api
+python -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
-scholar-api --host 0.0.0.0 --port 8000        # or: docker build -t scholar-api . && docker run -p 8000:8000 scholar-api
 ```
+
+## 2. Run the offline test suite (no internet needed)
 
 ```bash
-curl "http://localhost:8000/search.json?engine=google_scholar&q=attention+is+all+you+need&as_ylo=2017"
-curl "http://localhost:8000/search.json?engine=google_scholar_cite&q=5Gohgn6QFikJ"
-curl "http://localhost:8000/search.json?engine=google_scholar_author&author_id=oR9sCGYAAAAJ&num=100"
+pytest -v
 ```
 
-Every `serpapi_*` link in a response points back at your own server, so you can follow
-pagination, "cited by", versions, and author links the same way you would with SerpAPI.
-Interactive docs are at `/docs`.
+This runs 33 tests against saved Scholar pages in `tests/fixtures/`. They cover every
+parser, every endpoint, caching, retries, CAPTCHA handling, proxy rotation and a full
+end-to-end run over real HTTP. They should all pass on a fresh clone.
 
-### Use as a library
+## 3. Test against live Google Scholar
+
+```bash
+scholar-api check
+```
+
+This makes about 6 real requests, one per engine, spaced a few seconds apart. It prints a
+field-by-field report:
+
+```
+[1/5] google_scholar  {'q': 'attention is all you need'}
+    ok                 total results          2340000
+    ok                 title                  "Attention is all you need"
+    ok                 cited by               167432
+    ...
+32 required fields ok, 0 missing/failed.
+```
+
+It also saves each page's raw HTML and resulting JSON in `./scholar-check/`. Options:
+`--query "..."`, `--author-id JicYPdAAAAAJ`, `--profiles "name"`, `--save-dir DIR`.
+
+* **All `ok`**: the parsers match Scholar's current HTML.
+* **Some `MISSING`**: Google changed its markup. Copy the saved `.html` from `scholar-check/`
+  into `tests/fixtures/`, fix the selector in `scholar_api/parsers.py`, and rerun `pytest`.
+* **"Google is blocking this IP"**: see [Blocking](#blocking-read-this) below.
+
+## 4. Run the server
+
+```bash
+scholar-api serve                        # http://127.0.0.1:8000
+scholar-api serve --host 0.0.0.0 --port 8000
+# or with Docker:
+docker build -t scholar-api . && docker run -p 8000:8000 scholar-api
+```
+
+Then open:
+
+| URL | What it is |
+|---|---|
+| http://127.0.0.1:8000/docs | Interactive docs. Every parameter is documented; click **Try it out** to run queries from the browser |
+| http://127.0.0.1:8000/engines | Every engine, its parameters and a ready-to-click example URL |
+| http://127.0.0.1:8000/status | Per-proxy request, success, block and error counts, cache stats, pacing config |
+| http://127.0.0.1:8000/ | Service info and quick links |
+
+## 5. Try it
+
+```bash
+# Search
+curl "localhost:8000/search.json?q=attention+is+all+you+need"
+curl "localhost:8000/search.json?q=graph+neural+networks&as_ylo=2020&num=20"
+curl "localhost:8000/search.json?q=author:%22y+lecun%22+convolutional"
+
+# Papers citing a paper / all versions (ids come from inline_links in a search result)
+curl "localhost:8000/search.json?cites=2960712678066186980"
+curl "localhost:8000/search.json?cluster=2960712678066186980"
+
+# Citations + parsed BibTeX for a result (q = organic_results[].result_id)
+curl "localhost:8000/search.json?engine=google_scholar_cite&q=5Gohgn6QFikJ&include_bibtex=true"
+
+# Author profile; every article; a single article's record
+curl "localhost:8000/search.json?engine=google_scholar_author&author_id=JicYPdAAAAAJ"
+curl "localhost:8000/search.json?engine=google_scholar_author&author_id=JicYPdAAAAAJ&all_articles=true"
+curl "localhost:8000/search.json?engine=google_scholar_author&view_op=view_citation&citation_id=JicYPdAAAAAJ:u5HHmVD_uO8C"
+
+# Author search
+curl "localhost:8000/search.json?engine=google_scholar_profiles&mauthors=label:machine_learning"
+```
+
+Add `| python -m json.tool` to pretty-print the output. Every `serpapi_*` link in a
+response points back at your server, so you can follow pagination, "cited by", versions
+and author links directly.
+
+---
+
+## What's in a response
+
+Shared by every engine:
+
+```jsonc
+"search_metadata": {
+  "status": "Success",
+  "google_scholar_url": "https://scholar.google.com/scholar?q=...",   // the page that was scraped
+  "total_time_taken": 3.21,
+  "cached": false,            // true = served from cache, no request to Google
+  "scholar_requests": 1,      // HTTP requests made to Google (including retries)
+  "blocked_attempts": 0,      // how many of those hit a CAPTCHA
+  "pages_fetched": 1,
+  "warnings": ["Ignored unknown parameter 'foo' ..."]   // only when there is something to say
+}
+```
+
+Extra fields beyond what SerpAPI returns:
+
+* **Search results:**
+  * `publication_info` is split into `author_names`, `authors_truncated`, `venue`, `year`
+    and `source`.
+  * `inline_links.web_of_science` gives the Web of Science citation count and link.
+  * `search_information.did_you_mean` and `showing_results_for` carry spelling
+    suggestions, and `results_on_page` gives the result count.
+* **Cite:** with `include_bibtex=true`, `bibtex.raw` holds the file and `bibtex.parsed`
+  holds `{type, key, fields, authors}`.
+* **Author:**
+  * `public_access` gives the counts of available and not-available articles.
+  * `articles_summary` gives the number returned, `has_more`, and total citations.
+  * `all_articles=true` pages through the whole list, 100 articles per request.
+* **Article view:** `total_citations.graph` gives citations per year.
+
+Errors always look like this:
+
+```json
+{"error": "Missing 'author_id'", "error_type": "invalid_parameter", "hint": "The id is the user= value of a Scholar profile URL, e.g. JicYPdAAAAAJ."}
+```
+
+| HTTP | `error_type` | Meaning |
+|---|---|---|
+| 400 | `invalid_parameter` | Bad or missing parameter |
+| 401 | `unauthorized` | `SCHOLAR_API_KEY` is set and `api_key` is wrong or missing |
+| 404 | `not_found` | Scholar has no page for that id |
+| 502 | `upstream_error` | Google unreachable or returned 5xx |
+| 503 | `blocked` | Google returned a CAPTCHA or rate-limit page on every attempt |
+
+If a page parses to nothing, the response still succeeds, but a warning explains that
+Scholar's HTML may have changed.
+
+### Use as a Python library
 
 ```python
 import asyncio
@@ -40,7 +169,8 @@ async def main():
     client = ScholarClient(min_interval=5)
     data = await run("google_scholar", client, {"q": "graph neural networks", "num": 20})
     for r in data["organic_results"]:
-        print(r["title"], r["inline_links"].get("cited_by", {}).get("total"))
+        info = r["publication_info"]
+        print(info.get("year"), r["title"], r["inline_links"].get("cited_by", {}).get("total"))
     await client.aclose()
 
 asyncio.run(main())
@@ -50,18 +180,19 @@ asyncio.run(main())
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `SCHOLAR_PROXIES` | *(direct)* | Comma-separated proxy URLs, e.g. `http://user:pass@host:port,...`. Requests rotate across them. |
+| `SCHOLAR_PROXIES` | *(direct)* | Comma-separated proxy URLs, e.g. `http://user:pass@host:port,...`. Requests rotate across them |
 | `SCHOLAR_MIN_INTERVAL` | `3` | Minimum seconds between requests on one proxy |
 | `SCHOLAR_JITTER` | `2` | Random extra delay (0–N s) on each request |
-| `SCHOLAR_MAX_RETRIES` | `3` | Retries after a CAPTCHA/429/5xx (each retry uses the next proxy) |
+| `SCHOLAR_MAX_RETRIES` | `3` | Retries after a CAPTCHA, 429, 5xx or network error (each retry uses the next proxy) |
 | `SCHOLAR_BLOCK_COOLDOWN` | `600` | Seconds a blocked proxy is skipped |
 | `SCHOLAR_CACHE_TTL` | `3600` | In-memory cache TTL in seconds (`0` disables it) |
 | `SCHOLAR_TIMEOUT` | `20` | HTTP timeout in seconds |
 | `SCHOLAR_API_KEY` | *(none)* | If set, requests must include `api_key=<value>` |
+| `HOST` / `PORT` | `127.0.0.1` / `8000` | Server bind address |
 
 Run **one worker process**, because the rate limiter and cache live in memory.
 
-## The honest part: blocking
+## Blocking (read this)
 
 What you pay SerpAPI for is mostly not the parsing. It's the **proxy pool and CAPTCHA
 solving** that keep requests from getting blocked. Google Scholar has no official API and
@@ -73,15 +204,22 @@ rate-limits aggressively. Expect this:
 * **Volume**: you need rotating **residential** proxies (`SCHOLAR_PROXIES`). That costs
   money too, but usually far less than SerpAPI per request.
 
-When every attempt is blocked, the API returns HTTP `503` with
-`{"error": "Google Scholar returned a CAPTCHA ..."}`. The blocked proxy is benched,
-and its cookies and user-agent are rotated.
+When blocked, a proxy is benched for `SCHOLAR_BLOCK_COOLDOWN` seconds, and its cookies
+and user-agent are rotated. `GET /status` shows which proxies are getting blocked.
+`all_articles` and `include_bibtex` make extra requests, so use them sparingly.
 
 Scraping Google Scholar is against Google's Terms of Service. Use it responsibly, at low
 volume, and for your own research.
 
-## Maintenance
+## Project layout
 
-Google changes Scholar's HTML from time to time. All selectors live in
-`scholar_api/parsers.py`, and `tests/fixtures/` holds sample pages. If a field comes back empty,
-save the live page (`curl … > tests/fixtures/x.html`), update the selector, and run `pytest`.
+```
+scholar_api/
+  parsers.py   HTML -> dicts. All CSS selectors live here
+  client.py    HTTP: pacing, proxy rotation, CAPTCHA detection, retries, cache, stats
+  engines.py   Parameter spec + validation, SerpAPI envelope, diagnostics
+  app.py       FastAPI server (/search.json, /engines, /status, /docs)
+  check.py     `scholar-api check` live test
+tests/
+  fixtures/    Saved Scholar pages the parsers are tested against
+```

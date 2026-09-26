@@ -9,11 +9,13 @@ def link(engine, **params):
 
 def test_search_results():
     data = parsers.parse_search(fixture("search.html"), link)
-    assert data["search_information"] == {
-        "total_results": 2340000,
-        "time_taken_displayed": 0.07,
-        "query_displayed": "attention is all you need",
-    }
+    info = data["search_information"]
+    assert info["total_results"] == 2340000
+    assert info["time_taken_displayed"] == 0.07
+    assert info["query_displayed"] == "attention is all you need"
+    assert info["results_on_page"] == 3
+    assert info["did_you_mean"]["query"] == "attention is all you need"
+    assert info["did_you_mean"]["serpapi_link"].startswith("api:google_scholar:q=")
     results = data["organic_results"]
     assert len(results) == 3
 
@@ -36,6 +38,35 @@ def test_search_results():
     }
     assert links["serpapi_cite_link"] == "api:google_scholar_cite:q=5Gohgn6QFikJ"
     assert "related_pages_link" in links
+    assert links["web_of_science"]["total"] == 25000
+    assert "webofknowledge" in links["web_of_science"]["link"]
+
+
+def test_structured_publication_info():
+    results = parsers.parse_search(fixture("search.html"))["organic_results"]
+    first = results[0]["publication_info"]
+    assert first["author_names"] == ["A Vaswani", "N Shazeer", "N Parmar"]
+    assert first["authors_truncated"] is True
+    assert first["venue"] == "Advances in neural …"
+    assert first["year"] == 2017
+    assert first["source"] == "proceedings.neurips.cc"
+    book = results[1]["publication_info"]
+    assert book["year"] == 2016 and book["source"] == "books.google.com" and "venue" not in book
+    citation = results[2]["publication_info"]
+    assert citation["venue"] == "arXiv preprint arXiv:1706.03762" and "source" not in citation
+
+
+def test_split_publication_summary_edge_cases():
+    split = parsers.split_publication_summary
+    assert split("Y LeCun, Y Bengio, G Hinton - nature, 2015 - nature.com") == {
+        "authors_truncated": False,
+        "author_names": ["Y LeCun", "Y Bengio", "G Hinton"],
+        "source": "nature.com",
+        "year": 2015,
+        "venue": "nature",
+    }
+    assert split("J Smith - Springer") == {"authors_truncated": False, "author_names": ["J Smith"], "venue": "Springer"}
+    assert split("") == {}
 
 
 def test_search_result_types():
@@ -97,6 +128,11 @@ def test_author_profile():
     assert data["co_authors"][0]["author_id"] == "wsGvgA8AAAAJ"
     assert data["co_authors"][0]["affiliations"] == "Google"
     assert data["more_articles"] is True
+    assert data["public_access"] == {
+        "available": 12,
+        "not_available": 2,
+        "link": "https://scholar.google.com/citations?view_op=list_mandates&hl=en&user=oR9sCGYAAAAJ",
+    }
 
 
 def test_citation_view():
@@ -106,6 +142,24 @@ def test_citation_view():
     assert c["publication_date"] == "2017"
     assert c["journal"] == "Advances in neural information processing systems"
     assert c["total_citations"]["value"] == 167432
+    # 2023 has no bar -> 0
+    assert c["total_citations"]["graph"] == [
+        {"year": 2022, "citations": 30000},
+        {"year": 2023, "citations": 0},
+        {"year": 2024, "citations": 52000},
+    ]
+
+
+def test_bibtex():
+    entry = parsers.parse_bibtex(fixture("bibtex.bib"))
+    assert entry["type"] == "article" and entry["key"] == "vaswani2017attention"
+    assert entry["fields"]["title"] == "Attention is all you need"
+    assert entry["fields"]["year"] == "2017"
+    assert entry["authors"][:2] == ["Vaswani, Ashish", "Shazeer, Noam"]
+    assert len(entry["authors"]) == 8
+    quoted = parsers.parse_bibtex('@inproceedings{he2016, title="Deep {Residual} Learning", year=2016}')
+    assert quoted["fields"] == {"title": "Deep Residual Learning", "year": "2016"}
+    assert parsers.parse_bibtex("<html>nope</html>") is None
 
 
 def test_profiles():
@@ -122,5 +176,5 @@ def test_profiles():
 def test_block_detection():
     assert parsers.is_blocked(fixture("captcha.html"))
     assert parsers.is_blocked("", "https://www.google.com/sorry/index?continue=x")
-    for name in ("search.html", "author.html", "cite.html", "profiles.html"):
+    for name in ("search.html", "author.html", "cite.html", "profiles.html", "citation.html", "bibtex.bib"):
         assert not parsers.is_blocked(fixture(name))

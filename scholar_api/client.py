@@ -7,6 +7,7 @@ import asyncio
 import itertools
 import os
 import random
+import re
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -30,12 +31,40 @@ USER_AGENTS = [
 
 class ScholarError(Exception):
     status_code = 502
+    error_type = "upstream_error"
+    hint = "Google Scholar could not be reached or returned an error. Check your network / proxies and retry."
+
+    def __init__(self, message: str, status_code: Optional[int] = None):
+        super().__init__(message)
+        if status_code is not None:
+            self.status_code = status_code
+
+
+class NotFoundError(ScholarError):
+    status_code = 404
+    error_type = "not_found"
+    hint = "Scholar has no page for that id. Check author_id / citation_id / result_id."
 
 
 class BlockedError(ScholarError):
     """Google served a CAPTCHA / 'unusual traffic' page on every attempt."""
 
     status_code = 503
+    error_type = "blocked"
+    hint = (
+        "Google is rate-limiting this IP. Wait a while, raise SCHOLAR_MIN_INTERVAL, "
+        "or set SCHOLAR_PROXIES to rotating (ideally residential) proxies. See GET /status."
+    )
+
+
+@dataclass
+class FetchResult:
+    html: str
+    url: str
+    cached: bool = False
+    attempts: int = 0
+    blocked_attempts: int = 0
+    status_code: Optional[int] = None
 
 
 @dataclass
@@ -48,6 +77,11 @@ class _Slot:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     last_request: float = 0.0
     blocked_until: float = 0.0
+    requests: int = 0
+    successes: int = 0
+    blocks: int = 0
+    errors: int = 0
+    last_error: Optional[str] = None
 
 
 class TTLCache:
@@ -55,17 +89,21 @@ class TTLCache:
         self.ttl = ttl
         self.maxsize = maxsize
         self._data: OrderedDict[str, tuple[float, str]] = OrderedDict()
+        self.hits = 0
+        self.misses = 0
 
     def get(self, key: str) -> Optional[str]:
         entry = self._data.get(key)
-        if entry is None:
-            return None
-        stored, value = entry
-        if time.monotonic() - stored > self.ttl:
-            del self._data[key]
+        if entry is None or time.monotonic() - entry[0] > self.ttl:
+            self._data.pop(key, None)
+            self.misses += 1
             return None
         self._data.move_to_end(key)
-        return value
+        self.hits += 1
+        return entry[1]
+
+    def __len__(self) -> int:
+        return len(self._data)
 
     def set(self, key: str, value: str) -> None:
         if self.ttl <= 0 or self.maxsize <= 0:
@@ -162,48 +200,100 @@ class ScholarClient:
             await asyncio.sleep(delay)
         slot.last_request = time.monotonic()
 
-    async def get(self, path: str, params: dict, *, use_cache: bool = True) -> tuple[str, str]:
-        """GET ``path`` with ``params``; returns ``(html, final_url)``."""
+    async def get(self, path: str, params: dict, *, use_cache: bool = True) -> FetchResult:
+        """GET ``path`` (relative to Scholar) with ``params``."""
         params = {k: v for k, v in params.items() if v is not None and v != ""}
-        request = httpx.Request("GET", self.base_url + path, params=params)
-        url = str(request.url)
+        url = str(httpx.Request("GET", self.base_url + path, params=params).url)
+        return await self.get_url(url, use_cache=use_cache)
+
+    async def get_url(self, url: str, *, use_cache: bool = True) -> FetchResult:
+        """GET an absolute URL through the paced / rotated / retried pipeline."""
         if use_cache:
             cached = self.cache.get(url)
             if cached is not None:
-                return cached, url
+                return FetchResult(cached, url, cached=True)
 
+        result = FetchResult("", url)
         last_error: Exception = ScholarError("no attempt made")
         for attempt in range(self.max_retries + 1):
             slot = self._next_slot()
+            result.attempts += 1
             async with slot.lock:
                 await self._wait_turn(slot)
+                slot.requests += 1
                 try:
                     resp = await slot.client.get(url, headers={"User-Agent": slot.user_agent})
                 except httpx.HTTPError as exc:
+                    slot.errors += 1
+                    slot.last_error = f"{type(exc).__name__}: {exc}"
                     last_error = ScholarError(f"network error: {exc}")
                     await asyncio.sleep(min(2 ** attempt, 10))
                     continue
 
             html = resp.text
+            result.status_code = resp.status_code
             if resp.status_code == 429 or parsers.is_blocked(html, str(resp.url)):
                 # Bench this identity, get a fresh cookie jar + UA for later.
+                slot.blocks += 1
+                slot.last_error = f"blocked (HTTP {resp.status_code})"
                 slot.blocked_until = time.monotonic() + self.block_cooldown
                 slot.client.cookies.clear()
                 slot.user_agent = random.choice(USER_AGENTS)
+                result.blocked_attempts += 1
                 last_error = BlockedError(
-                    "Google Scholar returned a CAPTCHA / rate-limit page. "
-                    "Slow down (SCHOLAR_MIN_INTERVAL) or configure SCHOLAR_PROXIES."
+                    f"Google Scholar returned a CAPTCHA / rate-limit page on all {result.attempts} attempt(s)."
                 )
                 continue
             if resp.status_code == 404:
-                raise ScholarError("Google Scholar returned 404 (unknown id?)")
+                slot.errors += 1
+                raise NotFoundError("Google Scholar returned 404 for this request.")
             if resp.status_code >= 500:
+                slot.errors += 1
+                slot.last_error = f"HTTP {resp.status_code}"
                 last_error = ScholarError(f"Google Scholar returned HTTP {resp.status_code}")
                 await asyncio.sleep(min(2 ** attempt, 10))
                 continue
             if resp.status_code >= 400:
+                slot.errors += 1
                 raise ScholarError(f"Google Scholar returned HTTP {resp.status_code}")
 
+            slot.successes += 1
             self.cache.set(url, html)
-            return html, url
+            result.html, result.url = html, url
+            return result
         raise last_error
+
+    def stats(self) -> dict:
+        now = time.monotonic()
+        return {
+            "proxies": [
+                {
+                    "proxy": _mask(slot.proxy) if slot.proxy else "direct",
+                    "requests": slot.requests,
+                    "successes": slot.successes,
+                    "blocks": slot.blocks,
+                    "errors": slot.errors,
+                    "benched_for_seconds": max(0, round(slot.blocked_until - now)),
+                    "last_error": slot.last_error,
+                }
+                for slot in self._slots
+            ],
+            "cache": {
+                "entries": len(self.cache),
+                "max_entries": self.cache.maxsize,
+                "ttl_seconds": self.cache.ttl,
+                "hits": self.cache.hits,
+                "misses": self.cache.misses,
+            },
+            "pacing": {
+                "min_interval_seconds": self.min_interval,
+                "jitter_seconds": self.jitter,
+                "max_retries": self.max_retries,
+                "block_cooldown_seconds": self.block_cooldown,
+            },
+        }
+
+
+def _mask(proxy: str) -> str:
+    """Hide credentials: http://user:pass@host:1 -> http://***@host:1"""
+    return re.sub(r"//[^@/]+@", "//***@", proxy)
