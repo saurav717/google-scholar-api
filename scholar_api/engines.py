@@ -354,6 +354,7 @@ async def run(
         "cached": bool(ctx.fetches) and all(f.cached for f in ctx.fetches),
         "scholar_requests": sum(f.attempts for f in ctx.fetches),
         "blocked_attempts": sum(f.blocked_attempts for f in ctx.fetches),
+        "captchas_solved": sum(f.captchas_solved for f in ctx.fetches),
         "pages_fetched": len(ctx.fetches),
     }
     if len(ctx.fetches) > 1:

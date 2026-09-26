@@ -12,10 +12,12 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Optional
+from urllib.parse import urlsplit
 
 import httpx
 
 from . import parsers
+from .captcha import CaptchaError, CaptchaSolver, parse_challenge
 from .cookies import (
     BrowserCookieError,
     CookieStore,
@@ -76,7 +78,8 @@ class BlockedError(ScholarError):
     error_type = "blocked"
     hint = (
         "Google is rate-limiting this IP. Wait a while, raise SCHOLAR_MIN_INTERVAL, "
-        "or set SCHOLAR_PROXIES to rotating (ideally residential) proxies. See GET /status."
+        "set SCHOLAR_PROXIES to rotating (ideally residential) proxies, or set "
+        "SCHOLAR_CAPTCHA_PROVIDER to solve CAPTCHAs automatically. See GET /status."
     )
 
     def __init__(self, message: str, *, page: str = "", page_url: str = ""):
@@ -92,6 +95,8 @@ class FetchResult:
     cached: bool = False
     attempts: int = 0
     blocked_attempts: int = 0
+    captcha_attempts: int = 0
+    captchas_solved: int = 0
     status_code: Optional[int] = None
 
 
@@ -171,6 +176,10 @@ class ScholarClient:
         warmup: visit the Scholar homepage once per connection before the first
             query, like a person opening the site. Defaults to on, except when a
             test ``transport`` is given.
+        captcha_solver: when Google serves a reCAPTCHA / hCaptcha page, send it
+            to this paid solving service, submit the returned token on the same
+            connection (which earns a GOOGLE_ABUSE_EXEMPTION cookie) and carry
+            on, instead of benching the proxy. None = don't solve.
     """
 
     def __init__(
@@ -191,6 +200,7 @@ class ScholarClient:
         browser_cookies: Optional[str] = None,
         browser: Optional[str] = None,
         warmup: Optional[bool] = None,
+        captcha_solver: Optional[CaptchaSolver] = None,
         transport: Optional[httpx.AsyncBaseTransport] = None,
     ):
         if backend == "auto":
@@ -210,6 +220,7 @@ class ScholarClient:
         self.block_cooldown = block_cooldown
         self.cache = TTLCache(cache_ttl, cache_size)
         self.warmup = (transport is None) if warmup is None else warmup
+        self.solver = captcha_solver
         self.cookie_store = CookieStore(cookie_file) if cookie_file else None
         self._saved_cookies = self.cookie_store.load() if self.cookie_store else {}
         self.browser_cookies, self.ignored_browser_cookies = parse_browser_cookies(browser_cookies or "")
@@ -246,6 +257,7 @@ class ScholarClient:
             browser_cookies=os.getenv("SCHOLAR_COOKIES") or None,
             browser=os.getenv("SCHOLAR_BROWSER") or None,
             warmup=os.getenv("SCHOLAR_WARMUP", "1").lower() not in ("0", "false", "no", "off"),
+            captcha_solver=_solver_from_env(),
         )
         kwargs.update(overrides)
         return cls(**kwargs)
@@ -286,6 +298,8 @@ class ScholarClient:
                 await slot.client.close()
             else:
                 await slot.client.aclose()
+        if self.solver is not None:
+            await self.solver.aclose()
 
     def _save_cookies(self) -> None:
         if self.cookie_store is None:
@@ -366,8 +380,19 @@ class ScholarClient:
                     continue
 
             html = resp.text
+            blocked = resp.status_code == 429 or parsers.is_blocked(html, str(resp.url))
+            if blocked and self.solver is not None and result.captcha_attempts < self.solver.max_solves:
+                solved = await self._solve_block(slot, html, str(resp.url), url, result)
+                if solved is not None:
+                    resp, html = solved, solved.text
+                    blocked = resp.status_code == 429 or parsers.is_blocked(html, str(resp.url))
+                    if blocked:
+                        self.solver.rejected += 1
+                        self.solver.last_error = "Google rejected the solved token"
+                    else:
+                        result.captchas_solved += 1
             result.status_code = resp.status_code
-            if resp.status_code == 429 or parsers.is_blocked(html, str(resp.url)):
+            if blocked:
                 # Bench this identity, get a fresh cookie jar + UA for later.
                 slot.blocks += 1
                 slot.last_error = f"blocked (HTTP {resp.status_code})"
@@ -378,9 +403,12 @@ class ScholarClient:
                 if slot.user_agent:
                     slot.user_agent = random.choice(USER_AGENTS)
                 result.blocked_attempts += 1
+                solver_note = ""
+                if self.solver is not None and result.captcha_attempts:
+                    solver_note = f" CAPTCHA solving failed: {self.solver.last_error}."
                 last_error = BlockedError(
                     f"Google Scholar returned a CAPTCHA / rate-limit page (HTTP {resp.status_code}) "
-                    f"on all {result.attempts} attempt(s).",
+                    f"on all {result.attempts} attempt(s).{solver_note}",
                     page=html,
                     page_url=str(resp.url),
                 )
@@ -409,6 +437,45 @@ class ScholarClient:
             result.html, result.url = html, url
             return result
         raise last_error
+
+    async def _solve_block(self, slot: _Slot, html: str, page_url: str, url: str, result: FetchResult):
+        """Solve the CAPTCHA on a block page and submit it on ``slot``'s connection.
+        Returns the response for ``url`` afterwards, or None if the page has no
+        solvable widget or the service failed."""
+        challenge = parse_challenge(html, page_url)
+        if challenge is None:
+            return None  # e.g. a bare HTTP 429: nothing to solve
+        result.captcha_attempts += 1
+        async with slot.lock:
+            try:
+                token = await self.solver.solve(challenge, proxy=slot.proxy, user_agent=slot.user_agent)
+            except CaptchaError:
+                return None
+            form = {**challenge.fields, **{name: token for name in challenge.response_fields}}
+            headers = {"Referer": page_url}
+            if slot.user_agent:
+                headers["User-Agent"] = slot.user_agent
+            try:
+                slot.requests += 1
+                result.attempts += 1
+                if challenge.method == "GET":
+                    resp = await slot.client.get(challenge.submit_url, params=form, headers=headers)
+                else:
+                    resp = await slot.client.post(challenge.submit_url, data=form, headers=headers)
+                if parsers.is_blocked(resp.text, str(resp.url)) or resp.status_code == 429:
+                    return resp
+                if urlsplit(str(resp.url)).path != urlsplit(url).path:
+                    # The form didn't redirect back to the page: ask for it again.
+                    await self._wait_turn(slot)
+                    slot.requests += 1
+                    result.attempts += 1
+                    headers.pop("Referer")
+                    resp = await slot.client.get(url, headers=headers or None)
+            except self._network_errors as exc:
+                slot.errors += 1
+                slot.last_error = f"{type(exc).__name__}: {exc}"
+                return None
+            return resp
 
     @property
     def _network_errors(self) -> tuple:
@@ -449,6 +516,7 @@ class ScholarClient:
                 "browser_cookies": [c["name"] for c in self.browser_cookies],
                 "ignored_browser_cookies": self.ignored_browser_cookies,
             },
+            "captcha": {"enabled": True, **self.solver.stats()} if self.solver else {"enabled": False},
             "pacing": {
                 "min_interval_seconds": self.min_interval,
                 "jitter_seconds": self.jitter,
@@ -463,6 +531,24 @@ def _cookie_file_from_env() -> Optional[str]:
     if value is None:
         return str(default_cookie_file())
     return None if value.strip().lower() in ("", "0", "none", "off") else value
+
+
+def _solver_from_env() -> Optional[CaptchaSolver]:
+    provider = os.getenv("SCHOLAR_CAPTCHA_PROVIDER", "").strip()
+    if not provider or provider.lower() in ("none", "off", "0"):
+        return None
+    api_key = os.getenv("SCHOLAR_CAPTCHA_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("SCHOLAR_CAPTCHA_PROVIDER is set but SCHOLAR_CAPTCHA_API_KEY is empty")
+    return CaptchaSolver(
+        provider,
+        api_key,
+        timeout=float(os.getenv("SCHOLAR_CAPTCHA_TIMEOUT", "180")),
+        poll_interval=float(os.getenv("SCHOLAR_CAPTCHA_POLL_INTERVAL", "5")),
+        max_solves=int(os.getenv("SCHOLAR_CAPTCHA_MAX_SOLVES", "1")),
+        use_proxy=os.getenv("SCHOLAR_CAPTCHA_USE_PROXY", "1").lower() not in ("0", "false", "no", "off"),
+        api_url=os.getenv("SCHOLAR_CAPTCHA_API_URL") or None,
+    )
 
 
 def _mask(proxy: str) -> str:

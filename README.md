@@ -44,7 +44,7 @@ Always run tests with `python -m pytest` so they use this environment's Python.
 python -m pytest -v
 ```
 
-This runs 59 tests against saved Scholar pages in `tests/fixtures/`. They cover every
+This runs 71 tests against saved Scholar pages in `tests/fixtures/`. They cover every
 parser, every endpoint, caching, retries, CAPTCHA handling, proxy rotation and a full
 end-to-end run over real HTTP. They should all pass on a fresh clone.
 
@@ -89,7 +89,7 @@ Then open:
 |---|---|
 | http://127.0.0.1:8000/docs | Interactive docs. Every parameter is documented; click **Try it out** to run queries from the browser |
 | http://127.0.0.1:8000/engines | Every engine, its parameters and a ready-to-click example URL |
-| http://127.0.0.1:8000/status | Per-proxy request, success, block and error counts, cache stats, pacing config |
+| http://127.0.0.1:8000/status | Per-proxy request, success, block and error counts, CAPTCHA-solver stats, cache stats, pacing config |
 | http://127.0.0.1:8000/ | Service info and quick links |
 
 ## 5. Try it
@@ -134,6 +134,7 @@ Shared by every engine:
   "cached": false,            // true = served from cache, no request to Google
   "scholar_requests": 1,      // HTTP requests made to Google (including retries)
   "blocked_attempts": 0,      // how many of those hit a CAPTCHA
+  "captchas_solved": 0,       // CAPTCHAs cleared by the solving service (see below)
   "pages_fetched": 1,
   "warnings": ["Ignored unknown parameter 'foo' ..."]   // only when there is something to say
 }
@@ -214,6 +215,13 @@ asyncio.run(main())
 | `SCHOLAR_WARMUP` | `1` | Visit the Scholar homepage once per connection before the first query. `0` turns it off |
 | `SCHOLAR_COOKIES` | *(none)* | Cookies copied from your browser. See [Using your browser's cookies](#using-your-browsers-cookies) |
 | `SCHOLAR_BROWSER` | *(none)* | Read Scholar's cookies from this browser each time the scraper starts: `chrome`, `firefox`, `safari`, `edge`, `brave`, … or `auto` |
+| `SCHOLAR_CAPTCHA_PROVIDER` | *(none)* | Solve CAPTCHAs with a paid service: `2captcha`, `capsolver`, `anticaptcha` or `capmonster`. See [CAPTCHA solving](#captcha-solving) |
+| `SCHOLAR_CAPTCHA_API_KEY` | *(none)* | Your key for that service (required when a provider is set) |
+| `SCHOLAR_CAPTCHA_MAX_SOLVES` | `1` | CAPTCHAs to pay for per API request before giving up |
+| `SCHOLAR_CAPTCHA_TIMEOUT` | `180` | Seconds to wait for the service to solve one CAPTCHA |
+| `SCHOLAR_CAPTCHA_POLL_INTERVAL` | `5` | Seconds between result polls |
+| `SCHOLAR_CAPTCHA_USE_PROXY` | `1` | When the blocked request went through a proxy, have the service solve through that proxy too. `0` = solve from the service's own IPs |
+| `SCHOLAR_CAPTCHA_API_URL` | *(provider's)* | Override the service's API address |
 | `HOST` / `PORT` | `127.0.0.1` / `8000` | Server bind address |
 
 Run **one worker process**, because the rate limiter and cache live in memory.
@@ -245,6 +253,42 @@ are cleared. With no proxies configured, the API does **not** retry a CAPTCHA ri
 because retrying the same IP only extends the block. `scholar-api check` saves the block
 page to `scholar-check/blocked.html`. `GET /status` shows which proxies are getting blocked.
 `all_articles` and `include_bibtex` make extra requests, so use them sparingly.
+
+### CAPTCHA solving
+
+Instead of giving up when Google shows a CAPTCHA, the scraper can pay a solving service to
+solve it, the way SerpAPI does. Supported: [2Captcha](https://2captcha.com/),
+[CapSolver](https://www.capsolver.com/), [Anti-Captcha](https://anti-captcha.com/) and
+[CapMonster Cloud](https://capmonster.cloud/). All four use the same task API, so switching
+is just a setting:
+
+```bash
+export SCHOLAR_CAPTCHA_PROVIDER=2captcha      # or capsolver / anticaptcha / capmonster
+export SCHOLAR_CAPTCHA_API_KEY=<your key>
+scholar-api serve
+```
+
+What happens on a block:
+
+1. **Create task.** The reCAPTCHA (or hCaptcha) site key, the page URL and Google's `data-s`
+   value are read from the block page and sent to the service. If the request used a
+   proxy, the service solves through that proxy as well, so the token matches the IP.
+2. **Poll for the result** every `SCHOLAR_CAPTCHA_POLL_INTERVAL` seconds, for up to
+   `SCHOLAR_CAPTCHA_TIMEOUT`. Solving usually takes 10–60 s.
+3. **Inject the token.** The scraper submits the token in the page's own form on the same
+   connection. Google answers with a `GOOGLE_ABUSE_EXEMPTION` cookie, which is kept for
+   later requests, and the original request goes through. The proxy is not benched.
+
+If the page has nothing to solve (a bare HTTP 429), the service fails (for example, zero
+balance), or Google rejects the token, the request falls back to the usual block
+handling, and the error message says why. Each solve costs money (roughly $1–3 per
+1,000 reCAPTCHAs), so at most `SCHOLAR_CAPTCHA_MAX_SOLVES` are paid for per API request.
+`search_metadata.captchas_solved` shows solves for a request, and the `captcha` section of
+`GET /status` shows totals, failures, tokens Google rejected, average solve time and the
+last error.
+
+A CAPTCHA is Google asking you to slow down. Solving one doesn't lift the rate limit, so
+keep the pacing settings and proxies above in place as well.
 
 ### Using your browser's cookies
 
@@ -295,6 +339,7 @@ volume, and for your own research.
 scholar_api/
   parsers.py   HTML -> dicts. All CSS selectors live here
   client.py    HTTP: pacing, proxy rotation, CAPTCHA detection, retries, cache, stats
+  captcha.py   CAPTCHA-solving services (2Captcha, CapSolver, Anti-Captcha, CapMonster)
   engines.py   Parameter spec + validation, SerpAPI envelope, diagnostics
   app.py       FastAPI server (/search.json, /engines, /status, /docs)
   check.py     `scholar-api check` live test
