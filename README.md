@@ -44,7 +44,7 @@ Always run tests with `python -m pytest` so they use this environment's Python.
 python -m pytest -v
 ```
 
-This runs 42 tests against saved Scholar pages in `tests/fixtures/`. They cover every
+This runs 51 tests against saved Scholar pages in `tests/fixtures/`. They cover every
 parser, every endpoint, caching, retries, CAPTCHA handling, proxy rotation and a full
 end-to-end run over real HTTP. They should all pass on a fresh clone.
 
@@ -210,6 +210,9 @@ asyncio.run(main())
 | `SCHOLAR_API_KEY` | *(none)* | If set, requests must include `api_key=<value>` |
 | `SCHOLAR_HTTP_BACKEND` | `curl_cffi` | `curl_cffi` makes requests with a real Chrome TLS/HTTP2 fingerprint. `httpx` is a plain Python client that Google blocks quickly, so use it only for debugging |
 | `SCHOLAR_IMPERSONATE` | `chrome` | Browser profile for `curl_cffi`: `chrome`, `edge`, `safari`, … |
+| `SCHOLAR_COOKIE_FILE` | `~/.scholar-api/cookies.json` | Where Google's cookies are kept between runs (file mode 0600). `none` disables it |
+| `SCHOLAR_WARMUP` | `1` | Visit the Scholar homepage once per connection before the first query. `0` turns it off |
+| `SCHOLAR_COOKIES` | *(none)* | Cookies copied from your browser. See [Using your browser's cookies](#using-your-browsers-cookies) |
 | `HOST` / `PORT` | `127.0.0.1` / `8000` | Server bind address |
 
 Run **one worker process**, because the rate limiter and cache live in memory.
@@ -221,6 +224,10 @@ connects exactly like Chrome. This matters: in testing from a home connection, a
 Python client (`httpx`) got an immediate HTTP 429 and was redirected to Google's `/sorry/`
 page, while the same request through `curl_cffi` returned normal results. VPNs make
 blocks far more likely, because their IPs are shared and flagged.
+
+Google also trusts a **returning visitor** more than a brand-new one. So the scraper keeps
+the cookies Google gives it in `~/.scholar-api/cookies.json` and reuses them on the next
+run. It also opens the Scholar homepage once before its first query, as a person would.
 
 What you pay SerpAPI for is mostly not the parsing. It's the **proxy pool and CAPTCHA
 solving** that keep requests from getting blocked. Google Scholar has no official API and
@@ -237,6 +244,28 @@ are cleared. With no proxies configured, the API does **not** retry a CAPTCHA ri
 because retrying the same IP only extends the block. `scholar-api check` saves the block
 page to `scholar-check/blocked.html`. `GET /status` shows which proxies are getting blocked.
 `all_articles` and `include_bibtex` make extra requests, so use them sparingly.
+
+### Using your browser's cookies
+
+If Scholar opens fine in your browser but the scraper is blocked, you can let the scraper
+reuse your browser's standing with Scholar:
+
+1. Open https://scholar.google.com in Chrome, and solve a CAPTCHA if one appears.
+2. Open DevTools (`Cmd+Option+I` on a Mac, `F12` on Windows) → **Application** →
+   **Cookies** → `https://scholar.google.com`.
+3. Copy the values of `NID` and `GSP`. If you just solved a CAPTCHA, also copy
+   `GOOGLE_ABUSE_EXEMPTION`.
+4. Start the scraper with them:
+
+   ```bash
+   export SCHOLAR_COOKIES="NID=<value>; GSP=<value>"
+   scholar-api check        # or: scholar-api serve
+   ```
+
+Only `NID`, `GSP` and `GOOGLE_ABUSE_EXEMPTION` are ever used. Anything else you paste,
+including Google sign-in cookies such as `SID` or `SAPISID`, is dropped and listed under
+"ignored", so your Google account is never involved. These cookies expire, so refresh
+them if blocks come back. `GET /status` shows which cookies are in use.
 
 Scraping Google Scholar is against Google's Terms of Service. Use it responsibly, at low
 volume, and for your own research.

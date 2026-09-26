@@ -25,7 +25,7 @@ def _free_port() -> int:
 
 @pytest.fixture(params=["curl_cffi", "httpx"])
 def live(request):
-    state = {"hits": [], "block": 0}
+    state = {"hits": [], "block": 0, "cookies": []}
 
     class FakeScholar(http.server.BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -35,6 +35,15 @@ def live(request):
             url = urlparse(self.path)
             q = {k: v[0] for k, v in parse_qs(url.query).items()}
             state["hits"].append((time.monotonic(), self.path))
+            state["cookies"].append(self.headers.get("Cookie"))
+            if url.path == "/":  # homepage warm-up hands out a cookie, like Google does
+                body = b"<html><title>Google Scholar</title></html>"
+                self.send_response(200)
+                self.send_header("Set-Cookie", "NID=warm; Path=/")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if state["block"]:
                 state["block"] -= 1
                 name = "captcha.html"
@@ -86,6 +95,12 @@ def test_end_to_end(live):
     api, base, state, fake, backend = live
     assert api.get("/status").json()["http_backend"] == backend
 
+    first = api.get("/search.json", params={"q": "warm up first"})
+    assert first.status_code == 200
+    # Warm-up hit the homepage first, and the query carried its cookie back.
+    assert [p.split("?")[0] for _, p in state["hits"][:2]] == ["/", "/scholar"]
+    assert state["cookies"][0] is None and state["cookies"][1] == "NID=warm"
+
     body = api.get("/search.json", params={"q": "attention is all you need", "as_ylo": 2017}).json()
     assert len(body["organic_results"]) == 3
     first = body["organic_results"][0]
@@ -135,6 +150,7 @@ def test_end_to_end(live):
 
     status = api.get("/status").json()
     assert status["proxies"][0]["blocks"] == 4  # 1 + 3 attempts
+    assert status["proxies"][0]["warmup_requests"] == 1
 
     # Scholar unreachable -> clean JSON error, no crash.
     fake.shutdown()
