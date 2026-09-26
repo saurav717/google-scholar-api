@@ -18,7 +18,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+browser = ["browser-cookie3>=0.20.1"]
+dev = ["pytest>=8", "browser-cookie3>=0.20.1"]
 
 [project.scripts]
 scholar-api = "scholar_api.__main__:main"

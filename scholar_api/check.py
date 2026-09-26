@@ -168,8 +168,10 @@ async def run_check(query: str, author_id: str, profile_query: str, save_dir: Pa
           + (f" (saved to {session['cookie_file']})" if session["cookie_file"] else " (not persisted)"))
     if session["browser_cookies"]:
         print(f"Using your browser cookies: {', '.join(session['browser_cookies'])}")
+    if session["browser_import_error"]:
+        print(f"Could not read browser cookies: {session['browser_import_error']}")
     if session["ignored_browser_cookies"]:
-        print(f"Ignored browser cookies (not needed / sign-in): {', '.join(session['ignored_browser_cookies'])}")
+        print(f"Ignored {len(session['ignored_browser_cookies'])} other Google cookies (sign-in etc.); never used or saved.")
     print(f"{total_pass} required fields ok, {total_fail} missing/failed.")
     print(f"Raw HTML and JSON saved in {save_dir.resolve()}")
     if total_fail:
@@ -179,7 +181,7 @@ async def run_check(query: str, author_id: str, profile_query: str, save_dir: Pa
 
 def main(args) -> int:
     async def _run() -> int:
-        client = ScholarClient.from_env()
+        client = ScholarClient.from_env(**({"browser": args.browser} if args.browser else {}))
         try:
             return await run_check(args.query, args.author_id, args.profiles, Path(args.save_dir), client)
         finally:

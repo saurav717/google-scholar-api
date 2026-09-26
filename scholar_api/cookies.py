@@ -3,8 +3,9 @@ instead of a brand-new one on every run.
 
 * CookieStore persists each outbound identity's Google cookies to a JSON file
   (mode 0600) and restores them on the next run.
-* parse_browser_cookies() accepts a Cookie header copied from a browser, but
-  keeps only the Scholar anti-abuse cookies. Google account / sign-in cookies
+* parse_browser_cookies() accepts a Cookie header copied from a browser, and
+  read_browser_cookies() reads them straight from a local browser's cookie
+  store. Both keep only the Scholar anti-abuse cookies. Google account / sign-in cookies
   (SID, HSID, SSID, APISID, SAPISID, __Secure-*, ...) are always dropped, so a
   Google account is never involved.
 """
@@ -14,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Iterable, Optional
@@ -47,6 +49,74 @@ def parse_browser_cookies(header: str) -> tuple[list[dict], list[str]]:
         else:
             ignored.append(name)
     return kept, ignored
+
+
+BROWSERS = ("chrome", "firefox", "safari", "edge", "brave", "chromium", "opera", "vivaldi")
+
+
+class BrowserCookieError(RuntimeError):
+    pass
+
+
+def read_browser_cookies(browser: str, cookie_file: Optional[str] = None) -> tuple[list[dict], list[str]]:
+    """Read Scholar's cookies from a local browser's cookie store.
+
+    ``browser`` is one of BROWSERS, or "auto" to try each installed browser.
+    Only google.com cookies are loaded, and of those only NID, GSP and
+    GOOGLE_ABUSE_EXEMPTION are returned; the names of everything else (e.g.
+    sign-in cookies) come back in the second list. Values are never logged.
+
+    macOS: Chrome/Edge/Brave ask once for the Keychain password ("Chrome Safe
+    Storage"); Safari needs Full Disk Access for the terminal app.
+    """
+    try:
+        import browser_cookie3
+    except ImportError:
+        raise BrowserCookieError(
+            "Reading browser cookies needs the browser-cookie3 package: pip install -e \".[browser]\""
+        ) from None
+    browser = browser.strip().lower()
+    if browser == "auto":
+        loader = browser_cookie3.load
+    elif browser in BROWSERS:
+        loader = getattr(browser_cookie3, browser)
+    else:
+        raise BrowserCookieError(f"Unknown browser {browser!r}; use one of: auto, {', '.join(BROWSERS)}")
+    kwargs = {"domain_name": "google.com"}
+    if cookie_file and browser != "auto":
+        kwargs["cookie_file"] = cookie_file
+    try:
+        jar = loader(**kwargs)
+    except Exception as exc:  # locked DB, Keychain denied, browser not installed, ...
+        raise BrowserCookieError(f"Could not read {browser} cookies: {type(exc).__name__}: {exc}") from None
+
+    kept: dict[str, dict] = {}
+    ignored: list[str] = []
+    now = time.time()
+    for c in jar:
+        if not _is_google(c.domain or "") or (c.expires is not None and c.expires < now):
+            continue
+        if c.name not in ALLOWED_BROWSER_COOKIES:
+            if c.name not in ignored:
+                ignored.append(c.name)
+            continue
+        # GSP belongs to scholar.google.com; prefer that copy if several exist.
+        prev = kept.get(c.name)
+        if prev is None or "scholar" in (c.domain or ""):
+            kept[c.name] = {"name": c.name, "value": c.value, "domain": c.domain, "path": c.path or "/", "expires": c.expires}
+    ordered = [kept[n] for n in ALLOWED_BROWSER_COOKIES if n in kept]
+    garbled = [c["name"] for c in ordered if not _looks_like_cookie(c["value"])]
+    if garbled:
+        raise BrowserCookieError(
+            f"{browser} cookie values for {', '.join(garbled)} could not be decrypted correctly. "
+            "Update browser-cookie3 (pip install -U browser-cookie3) or paste them via SCHOLAR_COOKIES."
+        )
+    return ordered, ignored
+
+
+def _looks_like_cookie(value: str) -> bool:
+    """Cookie values are printable ASCII; mis-decrypted bytes are not."""
+    return bool(value) and all(33 <= ord(ch) <= 126 for ch in value)
 
 
 def _is_google(domain: str) -> bool:
@@ -108,3 +178,35 @@ class CookieStore:
         with os.fdopen(fd, "w") as f:
             json.dump({"version": 1, "slots": slots}, f, indent=1)
         os.replace(tmp, self.path)
+
+
+def import_from_browser_cli(browser: str, cookie_file: Optional[str] = None) -> int:
+    """`scholar-api import-cookies`: browser -> scraper cookie file."""
+    target = Path(cookie_file or os.getenv("SCHOLAR_COOKIE_FILE") or default_cookie_file()).expanduser()
+    if str(target).lower() in ("none", "0", "off"):
+        print("SCHOLAR_COOKIE_FILE is disabled; nothing to import into.")
+        return 1
+    print(f"Reading Scholar cookies from {browser}...")
+    if sys.platform == "darwin" and browser in ("chrome", "edge", "brave", "chromium", "opera", "vivaldi", "auto"):
+        print("(macOS may ask for your login/Keychain password to unlock the browser's cookie store. Click 'Allow'.)")
+    try:
+        cookies, ignored = read_browser_cookies(browser)
+    except BrowserCookieError as exc:
+        print(f"Failed: {exc}")
+        return 1
+    if not cookies:
+        print(
+            "No Scholar cookies found. Open https://scholar.google.com in that browser once "
+            "(solve a CAPTCHA if shown), close the tab, and run this again."
+        )
+        return 1
+    store = CookieStore(target)
+    slots = store.load()
+    names = {c["name"] for c in cookies}
+    slots["direct"] = [c for c in slots.get("direct", []) if c["name"] not in names] + cookies
+    store.save(slots)
+    print(f"Imported {', '.join(c['name'] for c in cookies)} into {target}")
+    if ignored:
+        print(f"Skipped {len(ignored)} other Google cookies (sign-in etc.); they were not saved.")
+    print("Every scholar-api run on this machine will now use them. Re-run this if blocks come back.")
+    return 0

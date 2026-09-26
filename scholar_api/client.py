@@ -17,11 +17,13 @@ import httpx
 
 from . import parsers
 from .cookies import (
+    BrowserCookieError,
     CookieStore,
     default_cookie_file,
     export_jar,
     import_cookies,
     parse_browser_cookies,
+    read_browser_cookies,
     slot_key,
 )
 
@@ -164,6 +166,8 @@ class ScholarClient:
         browser_cookies: a Cookie header copied from your browser. Only NID,
             GSP and GOOGLE_ABUSE_EXEMPTION are used; everything else (including
             Google sign-in cookies) is dropped.
+        browser: read those same cookies automatically from a local browser's
+            cookie store ("chrome", "firefox", "safari", ..., or "auto").
         warmup: visit the Scholar homepage once per connection before the first
             query, like a person opening the site. Defaults to on, except when a
             test ``transport`` is given.
@@ -185,6 +189,7 @@ class ScholarClient:
         impersonate: str = "chrome",
         cookie_file: Optional[str] = None,
         browser_cookies: Optional[str] = None,
+        browser: Optional[str] = None,
         warmup: Optional[bool] = None,
         transport: Optional[httpx.AsyncBaseTransport] = None,
     ):
@@ -208,6 +213,17 @@ class ScholarClient:
         self.cookie_store = CookieStore(cookie_file) if cookie_file else None
         self._saved_cookies = self.cookie_store.load() if self.cookie_store else {}
         self.browser_cookies, self.ignored_browser_cookies = parse_browser_cookies(browser_cookies or "")
+        self.browser = browser
+        self.browser_import_error: Optional[str] = None
+        if browser:
+            try:
+                from_browser, ignored = read_browser_cookies(browser)
+            except BrowserCookieError as exc:
+                self.browser_import_error = str(exc)
+            else:
+                pasted = {c["name"] for c in self.browser_cookies}
+                self.browser_cookies += [c for c in from_browser if c["name"] not in pasted]
+                self.ignored_browser_cookies += [n for n in ignored if n not in self.ignored_browser_cookies]
         self._slots = [
             self._make_slot(proxy, timeout, transport) for proxy in (proxies or [None])
         ]
@@ -228,6 +244,7 @@ class ScholarClient:
             impersonate=os.getenv("SCHOLAR_IMPERSONATE", "chrome"),
             cookie_file=_cookie_file_from_env(),
             browser_cookies=os.getenv("SCHOLAR_COOKIES") or None,
+            browser=os.getenv("SCHOLAR_BROWSER") or None,
             warmup=os.getenv("SCHOLAR_WARMUP", "1").lower() not in ("0", "false", "no", "off"),
         )
         kwargs.update(overrides)
@@ -427,6 +444,8 @@ class ScholarClient:
             "session": {
                 "cookie_file": str(self.cookie_store.path) if self.cookie_store else None,
                 "warmup": self.warmup,
+                "browser": self.browser,
+                "browser_import_error": self.browser_import_error,
                 "browser_cookies": [c["name"] for c in self.browser_cookies],
                 "ignored_browser_cookies": self.ignored_browser_cookies,
             },
