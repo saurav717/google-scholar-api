@@ -77,8 +77,9 @@ CHECKS: dict[str, list[tuple[str, str, bool]]] = {
     "google_scholar_profiles": [
         ("profiles", "profiles.0.name", True),
         ("author_id", "profiles.0.author_id", True),
-        ("affiliation", "profiles.0.affiliations", False),
-        ("cited by", "profiles.0.cited_by", False),
+        ("found via", "profiles.0.source", True),
+        ("profile box (optional)", "profiles.0.affiliations", False),
+        ("cited by (box only)", "profiles.0.cited_by", False),
     ],
 }
 

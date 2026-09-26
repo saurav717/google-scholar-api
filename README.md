@@ -9,7 +9,7 @@ and diagnostics. Client code written for SerpAPI mostly just needs a new base UR
 | `google_scholar` (default) | Search results, papers citing a paper (`cites`), all versions of a paper (`cluster`) |
 | `google_scholar_cite` | MLA/APA/Chicago/Harvard/Vancouver citations, export links, and optionally the parsed BibTeX |
 | `google_scholar_author` | Profile, citation metrics, citations per year, public-access stats, co-authors, articles (optionally all of them), or one article's full record |
-| `google_scholar_profiles` | Author search by name or `label:<interest>` |
+| `google_scholar_profiles` | Find author profiles by name (runs a regular search, since Scholar's own author search now requires sign-in) |
 
 ---
 
@@ -44,7 +44,7 @@ Always run tests with `python -m pytest` so they use this environment's Python.
 python -m pytest -v
 ```
 
-This runs 36 tests against saved Scholar pages in `tests/fixtures/`. They cover every
+This runs 42 tests against saved Scholar pages in `tests/fixtures/`. They cover every
 parser, every endpoint, caching, retries, CAPTCHA handling, proxy rotation and a full
 end-to-end run over real HTTP. They should all pass on a fresh clone.
 
@@ -113,7 +113,7 @@ curl "localhost:8000/search.json?engine=google_scholar_author&author_id=JicYPdAA
 curl "localhost:8000/search.json?engine=google_scholar_author&view_op=view_citation&citation_id=JicYPdAAAAAJ:u5HHmVD_uO8C"
 
 # Author search
-curl "localhost:8000/search.json?engine=google_scholar_profiles&mauthors=label:machine_learning"
+curl "localhost:8000/search.json?engine=google_scholar_profiles&mauthors=geoffrey+hinton"
 ```
 
 Add `| python -m json.tool` to pretty-print the output. Every `serpapi_*` link in a
@@ -154,6 +154,12 @@ Extra fields beyond what SerpAPI returns:
   * `articles_summary` gives the number returned, `has_more`, and total citations.
   * `all_articles=true` pages through the whole list, 100 articles per request.
 * **Article view:** `total_citations.graph` gives citations per year.
+* **Profiles:** Scholar's dedicated author search (`citations?view_op=search_authors`) now
+  redirects anonymous users to a Google sign-in page, so this engine searches Scholar for
+  the name. It returns the "User profiles for …" cards Scholar shows above the results
+  (`source: "profile_box"`, with affiliation, email and `cited_by`), plus linked authors on
+  the results whose name matches (`source: "search_results"`). Both include
+  `papers_in_results`. `label:` searches are no longer possible.
 
 Errors always look like this:
 
@@ -165,6 +171,7 @@ Errors always look like this:
 |---|---|---|
 | 400 | `invalid_parameter` | Bad or missing parameter |
 | 401 | `unauthorized` | `SCHOLAR_API_KEY` is set and `api_key` is wrong or missing |
+| 403 | `sign_in_required` | Google redirected to a sign-in page; that Scholar page can't be scraped anonymously |
 | 404 | `not_found` | Scholar has no page for that id |
 | 502 | `upstream_error` | Google unreachable or returned 5xx |
 | 503 | `blocked` | Google returned a CAPTCHA or rate-limit page on every attempt |

@@ -11,6 +11,7 @@ are omitted.
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Callable, Optional
 from urllib.parse import parse_qs, urljoin, urlparse
 
@@ -308,11 +309,7 @@ def parse_author(html: str, api_link: ApiLink = None) -> dict:
 
     interests = []
     for anchor in soup.select("#gsc_prf_int a"):
-        interest = {"title": _text(anchor), "link": _abs(anchor.get("href"))}
-        label = _qs(anchor.get("href"), "mauthors")
-        if api_link and label:
-            interest["serpapi_link"] = api_link("google_scholar_profiles", mauthors=label)
-        interests.append(interest)
+        interests.append({"title": _text(anchor), "link": _abs(anchor.get("href"))})
     author["interests"] = interests
 
     img = soup.select_one("#gsc_prf_pup-img")
@@ -489,54 +486,91 @@ def parse_citation(html: str) -> dict:
 
 # --------------------------------------------------------------------------
 # Author search (engine=google_scholar_profiles)
+#
+# Scholar's dedicated author search (citations?view_op=search_authors) now
+# redirects anonymous users to a Google sign-in page, so profiles are found
+# from a regular search instead: the "User profiles for ..." box Scholar shows
+# for name queries, plus the linked authors on the results themselves.
 # --------------------------------------------------------------------------
 
-def parse_profiles(html: str, api_link: ApiLink = None) -> dict:
+def _name_tokens(name: str) -> list[str]:
+    folded = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode().lower()
+    return re.findall(r"[a-z]+", folded)
+
+
+def name_matches(query: str, author_name: str) -> bool:
+    """'geoffrey hinton' matches 'G Hinton' / 'GE Hinton'; surname must match
+    and, when the query has a first name, so must its initial."""
+    q, a = _name_tokens(query), _name_tokens(author_name)
+    if not q or not a or q[-1] != a[-1]:
+        return False
+    return len(q) < 2 or len(a) < 2 or a[0][0] == q[0][0]
+
+
+def parse_profiles(html: str, query: str, api_link: ApiLink = None) -> dict:
     soup = _soup(html)
-    profiles = []
-    for node in soup.select(".gsc_1usr"):
-        anchor = node.select_one(".gs_ai_name a")
-        if anchor is None:
+    profiles: list[dict] = []
+    seen: set[str] = set()
+
+    def add(profile: dict) -> None:
+        author_id = profile["author_id"]
+        if api_link:
+            profile["serpapi_link"] = api_link("google_scholar_author", author_id=author_id)
+        seen.add(author_id)
+        profiles.append(profile)
+
+    # 1. "User profiles for <name>" box above the results.
+    for heading in soup.select("h4.gs_rt2"):
+        anchor = heading.select_one('a[href*="user="]')
+        author_id = _qs(anchor.get("href"), "user") if anchor else None
+        if not author_id or author_id in seen:
             continue
-        author_id = _qs(anchor.get("href"), "user")
         profile = {
             "name": _text(anchor),
             "link": _abs(anchor.get("href")),
             "author_id": author_id,
-            "affiliations": _text(node.select_one(".gs_ai_aff")),
-            "email": _text(node.select_one(".gs_ai_eml")),
-            "cited_by": _int(_text(node.select_one(".gs_ai_cby"))),
-            "interests": [],
+            "source": "profile_box",
         }
-        if api_link and author_id:
-            profile["serpapi_link"] = api_link("google_scholar_author", author_id=author_id)
-        for a in node.select(".gs_ai_int a"):
-            interest = {"title": _text(a), "link": _abs(a.get("href"))}
-            label = _qs(a.get("href"), "mauthors")
-            if api_link and label:
-                interest["serpapi_link"] = api_link("google_scholar_profiles", mauthors=label)
-            profile["interests"].append(interest)
-        img = node.select_one(".gs_ai_pho img")
+        cell = heading.parent
+        for line in (cell.find_all("div", recursive=False) if cell else []):
+            text = _text(line) or ""
+            if text.lower().startswith("cited by"):
+                profile["cited_by"] = _int(text)
+            elif "email" in text.lower():
+                profile["email"] = text
+            elif text and "affiliations" not in profile:
+                profile["affiliations"] = text
+        row = heading.find_parent("tr")
+        img = row.select_one("img") if row else None
         if img is not None and img.get("src"):
             profile["thumbnail"] = _abs(img["src"])
-        profiles.append(profile)
+        add(profile)
 
-    pagination: dict = {}
-    for direction in ("Next", "Previous"):
-        button = soup.select_one(f'button[aria-label="{direction}"]')
-        onclick = button.get("onclick") if button is not None else None
-        if not onclick or button.has_attr("disabled"):
+    # 2. Linked authors on the results whose name matches the query.
+    counts: dict[str, dict] = {}
+    for pub in soup.select("div.gs_r.gs_or .gs_a"):
+        for anchor in pub.find_all("a"):
+            author_id = _qs(anchor.get("href"), "user")
+            name = _text(anchor) or ""
+            if not author_id or not name_matches(query, name):
+                continue
+            entry = counts.setdefault(author_id, {"name": name, "link": _abs(anchor.get("href")), "papers": 0})
+            entry["papers"] += 1
+    for author_id, entry in sorted(counts.items(), key=lambda kv: -kv[1]["papers"]):
+        if author_id in seen:
+            for p in profiles:
+                if p["author_id"] == author_id:
+                    p["papers_in_results"] = entry["papers"]
             continue
-        m = re.search(r"window\.location='([^']+)'", onclick)
-        if not m:
-            continue
-        href = m.group(1).encode().decode("unicode_escape")  # \x3d -> =, \x26 -> &
-        key = direction.lower()
-        pagination[key] = _abs(href)
-        token = _qs(href, "after_author" if key == "next" else "before_author")
-        if token:
-            pagination[f"{key}_page_token"] = token
-    return {"profiles": profiles, "pagination": pagination}
+        add({
+            "name": entry["name"],
+            "link": entry["link"],
+            "author_id": author_id,
+            "source": "search_results",
+            "papers_in_results": entry["papers"],
+        })
+
+    return {"profiles": profiles, "pagination": _parse_pagination(soup)}
 
 
 # --------------------------------------------------------------------------
@@ -591,6 +625,13 @@ _BLOCK_MARKERS = (
     "Our systems have detected unusual traffic",
     "Please show you're not a robot",
 )
+
+
+def is_signin_page(html: str, url: str = "") -> bool:
+    """Google redirects some Scholar pages (e.g. author search) to a login form."""
+    return "accounts.google.com" in url or (
+        "Sign in to continue to Google Scholar" in html and 'id="gs_res_ccl"' not in html
+    )
 
 
 def is_blocked(html: str, url: str = "") -> bool:

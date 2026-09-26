@@ -29,11 +29,16 @@ class FakeScholar:
         if request.url.path == "/scholar.bib":
             return httpx.Response(200, text=fixture("bibtex.bib"))
         if request.url.path == "/scholar":
-            name = "cite.html" if p.get("output") == "cite" else "search.html"
+            if p.get("output") == "cite":
+                name = "cite.html"
+            elif "hinton" in p.get("q", ""):
+                name = "profiles_search.html"
+            else:
+                name = "search.html"
         elif p.get("view_op") == "view_citation":
             name = "citation.html"
         elif p.get("view_op") == "search_authors":
-            name = "profiles.html"
+            name = "signin.html"  # what Google serves anonymous users now
         else:
             name = "author.html"
         return httpx.Response(200, text=fixture(name))

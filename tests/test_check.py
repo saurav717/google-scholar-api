@@ -11,7 +11,7 @@ def _client(handler):
 
 
 def test_check_all_fields_present(fake, tmp_path, capsys):
-    code = asyncio.run(run_check("attention", "oR9sCGYAAAAJ", "hinton", tmp_path, _client(fake.handler)))
+    code = asyncio.run(run_check("attention", "oR9sCGYAAAAJ", "geoffrey hinton", tmp_path, _client(fake.handler)))
     out = capsys.readouterr().out
     assert code == 0, out
     assert "MISSING" not in out

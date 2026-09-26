@@ -53,6 +53,12 @@ class NotFoundError(ScholarError):
     hint = "Scholar has no page for that id. Check author_id / citation_id / result_id."
 
 
+class SignInRequiredError(ScholarError):
+    status_code = 403
+    error_type = "sign_in_required"
+    hint = "Google now requires a signed-in Google account for this Scholar page, so it can't be scraped anonymously."
+
+
 class BlockedError(ScholarError):
     """Google served a CAPTCHA / 'unusual traffic' page on every attempt."""
 
@@ -297,6 +303,9 @@ class ScholarClient:
                 if not self._available_slot():
                     break  # every proxy is benched; hammering the same IP extends the block
                 continue
+            if parsers.is_signin_page(html, str(resp.url)):
+                slot.successes += 1  # not a block: retrying won't help
+                raise SignInRequiredError(f"Google redirected to a sign-in page: {resp.url}")
             if resp.status_code == 404:
                 slot.errors += 1
                 raise NotFoundError("Google Scholar returned 404 for this request.")

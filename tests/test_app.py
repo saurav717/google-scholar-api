@@ -133,9 +133,38 @@ def test_openapi_documents_params(api):
 
 
 def test_profiles_endpoint(api, fake):
-    body = api.get("/search.json", params={"engine": "google_scholar_profiles", "mauthors": "hinton"}).json()
+    body = api.get("/search.json", params={"engine": "google_scholar_profiles", "mauthors": "geoffrey hinton"}).json()
     assert body["profiles"][0]["name"] == "Geoffrey Hinton"
-    assert "after_author=QnYlAHLB__8J" in body["serpapi_pagination"]["next"]
+    assert body["profiles"][0]["cited_by"] == 971020
+    assert body["serpapi_pagination"]["next"].endswith("mauthors=geoffrey+hinton&start=10")
+    # it's a regular search now, not the sign-in-walled author search
+    assert fake.requests[0].url.path == "/scholar" and fake.requests[0].url.params["q"] == "geoffrey hinton"
+
+
+def test_profiles_label_rejected(api):
+    r = api.get("/search.json", params={"engine": "google_scholar_profiles", "mauthors": "label:machine_learning"})
+    assert r.status_code == 400 and "sign-in" in r.json()["hint"]
+
+
+def test_profiles_no_match_warning(api):
+    body = api.get("/search.json", params={"engine": "google_scholar_profiles", "mauthors": "nobody"}).json()
+    assert body["profiles"] == []
+    assert "No linked author profile matching 'nobody'" in body["search_metadata"]["warnings"][0]
+
+
+def test_signin_page_reported_not_retried(fake):
+    import asyncio
+
+    import pytest
+
+    from scholar_api import SignInRequiredError
+
+    client = ScholarClient(min_interval=0, jitter=0, max_retries=3, transport=httpx.MockTransport(fake.handler))
+    # Scholar's old author-search URL now serves a Google sign-in form.
+    with pytest.raises(SignInRequiredError) as exc:
+        asyncio.run(client.get("/citations", {"view_op": "search_authors", "mauthors": "x"}))
+    assert exc.value.error_type == "sign_in_required" and exc.value.status_code == 403
+    assert len(fake.requests) == 1
 
 
 def test_param_errors(api):

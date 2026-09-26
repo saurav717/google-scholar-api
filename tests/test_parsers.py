@@ -162,19 +162,60 @@ def test_bibtex():
     assert parsers.parse_bibtex("<html>nope</html>") is None
 
 
-def test_profiles():
-    data = parsers.parse_profiles(fixture("profiles.html"), link)
-    p = data["profiles"][0]
-    assert p["name"] == "Geoffrey Hinton"
-    assert p["author_id"] == "JicYPdAAAAAJ"
-    assert p["cited_by"] == 850123
-    assert [i["title"] for i in p["interests"]] == ["machine learning", "psychology"]
-    assert data["pagination"]["next_page_token"] == "QnYlAHLB__8J"
-    assert "previous" not in data["pagination"]  # button is disabled
+def test_name_matches():
+    m = parsers.name_matches
+    assert m("geoffrey hinton", "G Hinton") and m("geoffrey hinton", "GE Hinton")
+    assert m("Geoffrey Hinton", "Geoffrey E. Hinton")
+    assert not m("geoffrey hinton", "A Hinton")  # different first initial
+    assert not m("geoffrey hinton", "I Sutskever")
+    assert m("hinton", "A Hinton")  # surname-only query matches any initial
+    assert m("jose garcia", "J García")  # accents folded
+    assert not m("", "G Hinton")
+
+
+def test_profiles_from_search():
+    data = parsers.parse_profiles(fixture("profiles_search.html"), "geoffrey hinton", link)
+    profiles = data["profiles"]
+    assert [p["author_id"] for p in profiles] == ["JicYPdAAAAAJ", "GEOFFxxAAAAJ"]
+
+    box = profiles[0]
+    assert box == {
+        "name": "Geoffrey Hinton",
+        "link": "https://scholar.google.com/citations?user=JicYPdAAAAAJ&hl=en&oi=ao",
+        "author_id": "JicYPdAAAAAJ",
+        "source": "profile_box",
+        "affiliations": "Emeritus Prof. Computer Science, University of Toronto",
+        "email": "Verified email at cs.toronto.edu",
+        "cited_by": 971020,
+        "thumbnail": "https://scholar.google.com/citations/images/avatar_scholar_56.png",
+        "serpapi_link": "api:google_scholar_author:author_id=JicYPdAAAAAJ",
+        "papers_in_results": 3,
+    }
+    other = profiles[1]
+    assert other["source"] == "search_results" and other["name"] == "G Hinton" and other["papers_in_results"] == 1
+    assert data["pagination"]["next"].endswith("start=10&q=geoffrey+hinton&hl=en&as_sdt=0,5")
+
+
+def test_profiles_without_box():
+    """If Scholar shows no profile box, matching linked authors are still found."""
+    html = fixture("profiles_search.html")
+    html = html[: html.index('<div class="gs_r"><h3')] + html[html.index('<div class="gs_r gs_or'):]
+    profiles = parsers.parse_profiles(html, "geoffrey hinton")["profiles"]
+    assert [(p["author_id"], p["source"], p["papers_in_results"]) for p in profiles] == [
+        ("JicYPdAAAAAJ", "search_results", 3),
+        ("GEOFFxxAAAAJ", "search_results", 1),
+    ]
+
+
+def test_signin_detection():
+    assert parsers.is_signin_page(fixture("signin.html"))
+    assert parsers.is_signin_page("", "https://accounts.google.com/v3/signin/identifier?continue=x")
+    for name in ("search.html", "author.html", "profiles_search.html"):
+        assert not parsers.is_signin_page(fixture(name))
 
 
 def test_block_detection():
     assert parsers.is_blocked(fixture("captcha.html"))
     assert parsers.is_blocked("", "https://www.google.com/sorry/index?continue=x")
-    for name in ("search.html", "author.html", "cite.html", "profiles.html", "citation.html", "bibtex.bib"):
+    for name in ("search.html", "author.html", "cite.html", "profiles_search.html", "citation.html", "bibtex.bib", "signin.html"):
         assert not parsers.is_blocked(fixture(name))
