@@ -19,7 +19,8 @@ dependencies = [
 
 [project.optional-dependencies]
 browser = ["browser-cookie3>=0.20.1"]
-dev = ["pytest>=8", "browser-cookie3>=0.20.1"]
+solver = ["playwright>=1.40"]
+dev = ["pytest>=8", "browser-cookie3>=0.20.1", "playwright>=1.40"]
 
 [project.scripts]
 scholar-api = "scholar_api.__main__:main"

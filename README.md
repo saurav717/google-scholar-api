@@ -44,7 +44,7 @@ Always run tests with `python -m pytest` so they use this environment's Python.
 python -m pytest -v
 ```
 
-This runs 71 tests against saved Scholar pages in `tests/fixtures/`. They cover every
+This runs 75 tests against saved Scholar pages in `tests/fixtures/`. They cover every
 parser, every endpoint, caching, retries, CAPTCHA handling, proxy rotation and a full
 end-to-end run over real HTTP. They should all pass on a fresh clone.
 
@@ -215,10 +215,12 @@ asyncio.run(main())
 | `SCHOLAR_WARMUP` | `1` | Visit the Scholar homepage once per connection before the first query. `0` turns it off |
 | `SCHOLAR_COOKIES` | *(none)* | Cookies copied from your browser. See [Using your browser's cookies](#using-your-browsers-cookies) |
 | `SCHOLAR_BROWSER` | *(none)* | Read Scholar's cookies from this browser each time the scraper starts: `chrome`, `firefox`, `safari`, `edge`, `brave`, … or `auto` |
-| `SCHOLAR_CAPTCHA_PROVIDER` | *(none)* | Solve CAPTCHAs with a paid service: `2captcha`, `capsolver`, `anticaptcha` or `capmonster`. See [CAPTCHA solving](#captcha-solving) |
-| `SCHOLAR_CAPTCHA_API_KEY` | *(none)* | Your key for that service (required when a provider is set) |
-| `SCHOLAR_CAPTCHA_MAX_SOLVES` | `1` | CAPTCHAs to pay for per API request before giving up |
-| `SCHOLAR_CAPTCHA_TIMEOUT` | `180` | Seconds to wait for the service to solve one CAPTCHA |
+| `SCHOLAR_CAPTCHA_PROVIDER` | *(none)* | Solve CAPTCHAs yourself in a browser window (`browser`), or with a paid service: `2captcha`, `capsolver`, `anticaptcha` or `capmonster`. See [CAPTCHA solving](#captcha-solving) |
+| `SCHOLAR_CAPTCHA_API_KEY` | *(none)* | Your key for the paid service (not needed for `browser`) |
+| `SCHOLAR_CAPTCHA_MAX_SOLVES` | `1` | CAPTCHAs to solve per API request before giving up |
+| `SCHOLAR_CAPTCHA_TIMEOUT` | `180` (`300` for `browser`) | Seconds to wait for one CAPTCHA to be solved |
+| `SCHOLAR_CAPTCHA_BROWSER_CHANNEL` | `chrome` | `browser` only: which browser to open. `chrome` uses your installed Google Chrome, falling back to Playwright's Chromium; also `msedge`, or empty for Chromium |
+| `SCHOLAR_CAPTCHA_BROWSER_PATH` | *(none)* | `browser` only: path to a specific Chrome/Chromium binary |
 | `SCHOLAR_CAPTCHA_POLL_INTERVAL` | `5` | Seconds between result polls |
 | `SCHOLAR_CAPTCHA_USE_PROXY` | `1` | When the blocked request went through a proxy, have the service solve through that proxy too. `0` = solve from the service's own IPs |
 | `SCHOLAR_CAPTCHA_API_URL` | *(provider's)* | Override the service's API address |
@@ -256,8 +258,43 @@ page to `scholar-check/blocked.html`. `GET /status` shows which proxies are gett
 
 ### CAPTCHA solving
 
-Instead of giving up when Google shows a CAPTCHA, the scraper can pay a solving service to
-solve it, the way SerpAPI does. Supported: [2Captcha](https://2captcha.com/),
+Instead of giving up when Google shows a CAPTCHA, the scraper can get it solved: by you, in
+a browser window, for free, or by a paid solving service, the way SerpAPI does.
+
+#### Solve it yourself in a browser (free)
+
+```bash
+pip install -e ".[solver]"        # Playwright
+playwright install chromium       # only needed if you don't have Google Chrome
+export SCHOLAR_CAPTCHA_PROVIDER=browser
+scholar-api serve                 # or: scholar-api check
+```
+
+When Google blocks a request:
+
+1. A browser window opens on the block page, going through the same proxy as the blocked
+   request. The terminal beeps and prints `Google is showing a CAPTCHA. Solve it in the
+   browser window...`.
+2. You tick the box or solve the image grid. The window is seeded with the scraper's own
+   Google cookies, so Google sees the same visitor.
+3. When Google accepts it, the window closes and the scraper takes the
+   `GOOGLE_ABUSE_EXEMPTION` cookie Google set (plus `NID`/`GSP`, never sign-in cookies),
+   retries the request and carries on. The cookie is saved to the cookie file and usually
+   lasts for hours.
+
+The API request waits while you solve, up to `SCHOLAR_CAPTCHA_TIMEOUT` (5 minutes), so
+give your HTTP client a long timeout. Only one window opens at a time. Other requests on
+the same connection that were blocked at the same moment reuse the solve instead of
+opening their own window. While a CAPTCHA is waiting, `GET /status` shows
+`captcha.waiting_for_person: true` and the page URL. If you close the window or don't solve
+it in time, the request fails with the usual `blocked` error.
+
+This needs a desktop to show the window. It won't work inside Docker or on a headless
+server, where the error says so; use a paid provider there.
+
+#### Paid solving services
+
+Supported: [2Captcha](https://2captcha.com/),
 [CapSolver](https://www.capsolver.com/), [Anti-Captcha](https://anti-captcha.com/) and
 [CapMonster Cloud](https://capmonster.cloud/). All four use the same task API, so switching
 is just a setting:
@@ -340,6 +377,7 @@ scholar_api/
   parsers.py   HTML -> dicts. All CSS selectors live here
   client.py    HTTP: pacing, proxy rotation, CAPTCHA detection, retries, cache, stats
   captcha.py   CAPTCHA-solving services (2Captcha, CapSolver, Anti-Captcha, CapMonster)
+  browser_solver.py  Solve CAPTCHAs yourself in a browser window
   engines.py   Parameter spec + validation, SerpAPI envelope, diagnostics
   app.py       FastAPI server (/search.json, /engines, /status, /docs)
   check.py     `scholar-api check` live test

@@ -17,7 +17,8 @@ from urllib.parse import urlsplit
 import httpx
 
 from . import parsers
-from .captcha import CaptchaError, CaptchaSolver, parse_challenge
+from .browser_solver import BrowserSolver
+from .captcha import CaptchaError, CaptchaSolver, Challenge, parse_challenge
 from .cookies import (
     BrowserCookieError,
     CookieStore,
@@ -176,10 +177,12 @@ class ScholarClient:
         warmup: visit the Scholar homepage once per connection before the first
             query, like a person opening the site. Defaults to on, except when a
             test ``transport`` is given.
-        captcha_solver: when Google serves a reCAPTCHA / hCaptcha page, send it
-            to this paid solving service, submit the returned token on the same
-            connection (which earns a GOOGLE_ABUSE_EXEMPTION cookie) and carry
-            on, instead of benching the proxy. None = don't solve.
+        captcha_solver: what to do when Google serves a CAPTCHA page instead of
+            benching the proxy. A CaptchaSolver sends it to a paid solving
+            service and submits the returned token on the same connection; a
+            BrowserSolver opens it in a browser window for a person to solve.
+            Either way Google hands back a GOOGLE_ABUSE_EXEMPTION cookie that
+            later requests reuse. None = don't solve.
     """
 
     def __init__(
@@ -200,7 +203,7 @@ class ScholarClient:
         browser_cookies: Optional[str] = None,
         browser: Optional[str] = None,
         warmup: Optional[bool] = None,
-        captcha_solver: Optional[CaptchaSolver] = None,
+        captcha_solver: Optional[CaptchaSolver | BrowserSolver] = None,
         transport: Optional[httpx.AsyncBaseTransport] = None,
     ):
         if backend == "auto":
@@ -443,6 +446,11 @@ class ScholarClient:
         Returns the response for ``url`` afterwards, or None if the page has no
         solvable widget or the service failed."""
         challenge = parse_challenge(html, page_url)
+        if isinstance(self.solver, BrowserSolver):
+            # A person can deal with any block page, widget or not.
+            challenge = challenge or Challenge(kind="unknown", sitekey="", page_url=page_url)
+            result.captcha_attempts += 1
+            return await self._clear_in_browser(slot, challenge, url, result)
         if challenge is None:
             return None  # e.g. a bare HTTP 429: nothing to solve
         result.captcha_attempts += 1
@@ -476,6 +484,30 @@ class ScholarClient:
                 slot.last_error = f"{type(exc).__name__}: {exc}"
                 return None
             return resp
+
+    async def _clear_in_browser(self, slot: _Slot, challenge: Challenge, url: str, result: FetchResult):
+        """Have a person solve the block page in a browser, copy the cookies
+        Google set into ``slot`` and fetch ``url`` again."""
+        blocked_at = time.monotonic()
+        async with slot.lock:  # nothing else goes out on this IP while the person solves
+            try:
+                cookies = await self.solver.clear(
+                    challenge, key=slot.key, blocked_at=blocked_at, proxy=slot.proxy,
+                    user_agent=slot.user_agent, cookies=export_jar(slot.client.cookies),
+                )
+            except CaptchaError:
+                return None
+            import_cookies(slot.client.cookies, cookies)
+            await self._wait_turn(slot)
+            slot.requests += 1
+            result.attempts += 1
+            headers = {"User-Agent": slot.user_agent} if slot.user_agent else None
+            try:
+                return await slot.client.get(url, headers=headers)
+            except self._network_errors as exc:
+                slot.errors += 1
+                slot.last_error = f"{type(exc).__name__}: {exc}"
+                return None
 
     @property
     def _network_errors(self) -> tuple:
@@ -533,10 +565,17 @@ def _cookie_file_from_env() -> Optional[str]:
     return None if value.strip().lower() in ("", "0", "none", "off") else value
 
 
-def _solver_from_env() -> Optional[CaptchaSolver]:
+def _solver_from_env() -> Optional[CaptchaSolver | BrowserSolver]:
     provider = os.getenv("SCHOLAR_CAPTCHA_PROVIDER", "").strip()
     if not provider or provider.lower() in ("none", "off", "0"):
         return None
+    if provider.lower() == "browser":
+        return BrowserSolver(
+            timeout=float(os.getenv("SCHOLAR_CAPTCHA_TIMEOUT", "300")),
+            max_solves=int(os.getenv("SCHOLAR_CAPTCHA_MAX_SOLVES", "1")),
+            channel=os.getenv("SCHOLAR_CAPTCHA_BROWSER_CHANNEL", "chrome") or None,
+            executable_path=os.getenv("SCHOLAR_CAPTCHA_BROWSER_PATH") or None,
+        )
     api_key = os.getenv("SCHOLAR_CAPTCHA_API_KEY", "").strip()
     if not api_key:
         raise ValueError("SCHOLAR_CAPTCHA_PROVIDER is set but SCHOLAR_CAPTCHA_API_KEY is empty")
