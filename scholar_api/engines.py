@@ -77,13 +77,16 @@ ENGINE_DOCS: dict[str, dict] = {
         },
     },
     "google_scholar_profiles": {
-        "description": "Search Scholar author profiles by name or by label (label:machine_learning). Google has been restricting this page; it may return nothing.",
-        "scholar_page": "https://scholar.google.com/citations?view_op=search_authors",
+        "description": (
+            "Find author profiles by name. Scholar's own author search now requires a Google sign-in, "
+            "so this runs a regular Scholar search for the name and returns (1) the 'User profiles for ...' "
+            "cards Scholar shows above the results and (2) linked authors on the results whose name matches, "
+            "with papers_in_results counts. Use google_scholar_author on an author_id for full details."
+        ),
+        "scholar_page": "https://scholar.google.com/scholar?q=<name>",
         "params": {
-            "mauthors": {"description": "Author name, or label:<interest> (required).", "example": "geoffrey hinton"},
-            "after_author": {"description": "Next-page token (pagination.next_page_token)."},
-            "before_author": {"description": "Previous-page token (pagination.previous_page_token)."},
-            "astart": {"description": "Result offset that accompanies after_author/before_author (set automatically in serpapi_pagination links)."},
+            "mauthors": {"description": "Author name, e.g. 'geoffrey hinton' (required). label:<interest> searches are no longer possible without sign-in.", "example": "geoffrey hinton"},
+            "start": {"description": "Result offset of the underlying search, to scan more papers (0, 10, 20 ...).", "example": "0"},
         },
     },
 }
@@ -283,35 +286,29 @@ async def google_scholar_author(ctx: Ctx) -> dict:
 
 async def google_scholar_profiles(ctx: Ctx) -> dict:
     p = ctx.params
-    mauthors = p.get("mauthors")
+    mauthors = (p.get("mauthors") or "").strip()
     if not mauthors:
-        raise ParamError("Missing 'mauthors'", hint="An author name, or label:<interest> e.g. label:robotics")
-    query = {
-        "view_op": "search_authors",
-        "mauthors": mauthors,
-        "hl": ctx.hl,
-        "after_author": p.get("after_author"),
-        "before_author": p.get("before_author"),
-        "astart": p.get("astart"),
-    }
-    fetched = await ctx.get("/citations", query)
-    data = parsers.parse_profiles(fetched.html, ctx.api_link)
-    if not data["profiles"]:
-        ctx.warnings.append(
-            _layout_warning("profiles") + " Note: Google has been restricting author search."
+        raise ParamError("Missing 'mauthors'", hint="An author name, e.g. mauthors=geoffrey+hinton")
+    if mauthors.lower().startswith("label:"):
+        raise ParamError(
+            "label: searches are not supported",
+            hint="Google now requires sign-in for Scholar's interest/label search. Search by author name instead.",
         )
-    if ctx.api_link:
-        pag = {}
-        for key, token_param in (("next", "after_author"), ("previous", "before_author")):
-            href = data["pagination"].get(key)
-            token = data["pagination"].get(f"{key}_page_token")
-            if href and token:
-                pag[key] = ctx.api_link(
-                    "google_scholar_profiles", mauthors=mauthors,
-                    **{token_param: token}, astart=parsers._qs(href, "astart"),
-                )
-        if pag:
-            data["serpapi_pagination"] = pag
+    start = _int_param(p, "start", 0, 0, 1000)
+    fetched = await ctx.get("/scholar", {"q": mauthors, "hl": ctx.hl, "start": start or None})
+    data = parsers.parse_profiles(fetched.html, mauthors, ctx.api_link)
+    if not data["profiles"]:
+        if parsers.parse_search(fetched.html)["organic_results"]:
+            ctx.warnings.append(
+                f"No linked author profile matching {mauthors!r} on this page of results. "
+                "The author may have no public Scholar profile; try the full name or start=10."
+            )
+        else:
+            ctx.warnings.append(_layout_warning("search results"))
+    if ctx.api_link and data["pagination"].get("next"):
+        data["serpapi_pagination"] = {
+            "next": ctx.api_link("google_scholar_profiles", mauthors=mauthors, start=start + 10)
+        }
     return data
 
 

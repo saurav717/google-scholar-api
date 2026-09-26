@@ -39,11 +39,16 @@ def live(request):
                 state["block"] -= 1
                 name = "captcha.html"
             elif url.path == "/scholar":
-                name = "cite.html" if q.get("output") == "cite" else "search.html"
+                if q.get("output") == "cite":
+                    name = "cite.html"
+                elif "hinton" in q.get("q", ""):
+                    name = "profiles_search.html"
+                else:
+                    name = "search.html"
             elif q.get("view_op") == "view_citation":
                 name = "citation.html"
             elif q.get("view_op") == "search_authors":
-                name = "profiles.html"
+                name = "signin.html"
             else:
                 name = "author.html"
             body = fixture(name).encode()
@@ -101,8 +106,11 @@ def test_end_to_end(live):
     article = api.get(author["articles"][0]["serpapi_link"].removeprefix(base)).json()
     assert article["citation"]["title"] == "Attention is all you need"
 
-    profiles = api.get("/search.json", params={"engine": "google_scholar_profiles", "mauthors": "hinton"}).json()
+    profiles = api.get("/search.json", params={"engine": "google_scholar_profiles", "mauthors": "geoffrey hinton"}).json()
+    assert profiles["profiles"][0]["author_id"] == "JicYPdAAAAAJ"
     assert api.get(profiles["serpapi_pagination"]["next"].removeprefix(base)).status_code == 200
+    hinton = api.get(profiles["profiles"][0]["serpapi_link"].removeprefix(base)).json()
+    assert "author" in hinton
 
     # Pacing: consecutive upstream requests are >= min_interval apart
     # (small tolerance: the timer starts when the request is sent, not received).
