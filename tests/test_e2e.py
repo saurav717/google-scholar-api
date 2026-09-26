@@ -23,8 +23,8 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-@pytest.fixture
-def live():
+@pytest.fixture(params=["curl_cffi", "httpx"])
+def live(request):
     state = {"hits": [], "block": 0}
 
     class FakeScholar(http.server.BaseHTTPRequestHandler):
@@ -58,7 +58,7 @@ def live():
 
     client = ScholarClient(
         base_url=f"http://127.0.0.1:{fake.server_address[1]}",
-        min_interval=0.2, jitter=0, max_retries=2, block_cooldown=0,
+        min_interval=0.2, jitter=0, max_retries=2, block_cooldown=0, backend=request.param,
     )
     port = _free_port()
     server = uvicorn.Server(uvicorn.Config(create_app(client=client, api_key=""), port=port, log_level="warning"))
@@ -70,7 +70,7 @@ def live():
 
     base = f"http://127.0.0.1:{port}"
     with httpx.Client(base_url=base, timeout=30, trust_env=False) as http_client:
-        yield http_client, base, state, fake
+        yield http_client, base, state, fake, request.param
     server.should_exit = True
     thread.join(timeout=5)
     fake.shutdown()
@@ -78,7 +78,8 @@ def live():
 
 
 def test_end_to_end(live):
-    api, base, state, fake = live
+    api, base, state, fake, backend = live
+    assert api.get("/status").json()["http_backend"] == backend
 
     body = api.get("/search.json", params={"q": "attention is all you need", "as_ylo": 2017}).json()
     assert len(body["organic_results"]) == 3

@@ -15,23 +15,36 @@ and diagnostics. Client code written for SerpAPI mostly just needs a new base UR
 
 ## 1. Install
 
-Requires Python 3.10+.
+Requires **Python 3.10+** (check with `python --version`).
 
 ```bash
 git clone https://github.com/saurav717/google-scholar-api.git
 cd google-scholar-api
 python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
+python -m pip install --upgrade pip   # pip older than 21.3 can't do editable installs
 pip install -e ".[dev]"
 ```
+
+**Using Anaconda?** Its `base` Python may be too old, and `base`'s own `pytest` can
+crash on unrelated plugins. Use a dedicated environment instead of the venv above:
+
+```bash
+conda create -n scholar-api python=3.12 -y
+conda activate scholar-api            # do this in every new terminal
+python -m pip install --upgrade pip
+pip install -e ".[dev]"
+```
+
+Always run tests with `python -m pytest` so they use this environment's Python.
 
 ## 2. Run the offline test suite (no internet needed)
 
 ```bash
-pytest -v
+python -m pytest -v
 ```
 
-This runs 33 tests against saved Scholar pages in `tests/fixtures/`. They cover every
+This runs 36 tests against saved Scholar pages in `tests/fixtures/`. They cover every
 parser, every endpoint, caching, retries, CAPTCHA handling, proxy rotation and a full
 end-to-end run over real HTTP. They should all pass on a fresh clone.
 
@@ -188,11 +201,19 @@ asyncio.run(main())
 | `SCHOLAR_CACHE_TTL` | `3600` | In-memory cache TTL in seconds (`0` disables it) |
 | `SCHOLAR_TIMEOUT` | `20` | HTTP timeout in seconds |
 | `SCHOLAR_API_KEY` | *(none)* | If set, requests must include `api_key=<value>` |
+| `SCHOLAR_HTTP_BACKEND` | `curl_cffi` | `curl_cffi` makes requests with a real Chrome TLS/HTTP2 fingerprint. `httpx` is a plain Python client that Google blocks quickly, so use it only for debugging |
+| `SCHOLAR_IMPERSONATE` | `chrome` | Browser profile for `curl_cffi`: `chrome`, `edge`, `safari`, … |
 | `HOST` / `PORT` | `127.0.0.1` / `8000` | Server bind address |
 
 Run **one worker process**, because the rate limiter and cache live in memory.
 
 ## Blocking (read this)
+
+Requests go out through [`curl_cffi`](https://github.com/lexiforest/curl_cffi), which
+connects exactly like Chrome. This matters: in testing from a home connection, a plain
+Python client (`httpx`) got an immediate HTTP 429 and was redirected to Google's `/sorry/`
+page, while the same request through `curl_cffi` returned normal results. VPNs make
+blocks far more likely, because their IPs are shared and flagged.
 
 What you pay SerpAPI for is mostly not the parsing. It's the **proxy pool and CAPTCHA
 solving** that keep requests from getting blocked. Google Scholar has no official API and
@@ -205,7 +226,9 @@ rate-limits aggressively. Expect this:
   money too, but usually far less than SerpAPI per request.
 
 When blocked, a proxy is benched for `SCHOLAR_BLOCK_COOLDOWN` seconds, and its cookies
-and user-agent are rotated. `GET /status` shows which proxies are getting blocked.
+are cleared. With no proxies configured, the API does **not** retry a CAPTCHA right away,
+because retrying the same IP only extends the block. `scholar-api check` saves the block
+page to `scholar-check/blocked.html`. `GET /status` shows which proxies are getting blocked.
 `all_articles` and `include_bibtex` make extra requests, so use them sparingly.
 
 Scraping Google Scholar is against Google's Terms of Service. Use it responsibly, at low

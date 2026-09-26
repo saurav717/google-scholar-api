@@ -28,6 +28,7 @@ def test_check_reports_missing_and_stops_when_blocked(fake, tmp_path, capsys):
     assert code == 1
     assert "blocking this IP" in out
     assert len(fake.requests) == 1
+    assert (tmp_path / "blocked.html").read_text().startswith("<html><body><div id=\"gs_captcha_ccl\">")
 
 
 def test_check_flags_broken_layout(tmp_path, capsys):

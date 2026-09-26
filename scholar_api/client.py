@@ -17,6 +17,13 @@ import httpx
 
 from . import parsers
 
+try:  # Chrome-impersonating HTTP client; plain httpx gets 429'd by Google quickly.
+    from curl_cffi import CurlError
+    from curl_cffi.requests import AsyncSession as CurlSession
+except ImportError:  # pragma: no cover - curl_cffi is a hard dependency, but stay importable
+    CurlSession = None
+    CurlError = None
+
 SCHOLAR_BASE = parsers.SCHOLAR_BASE
 
 USER_AGENTS = [
@@ -56,6 +63,11 @@ class BlockedError(ScholarError):
         "or set SCHOLAR_PROXIES to rotating (ideally residential) proxies. See GET /status."
     )
 
+    def __init__(self, message: str, *, page: str = "", page_url: str = ""):
+        super().__init__(message)
+        self.page = page  # the CAPTCHA / 'unusual traffic' page Google returned
+        self.page_url = page_url
+
 
 @dataclass
 class FetchResult:
@@ -72,8 +84,8 @@ class _Slot:
     """One outbound identity: a proxy (or direct), its own cookies and pacing."""
 
     proxy: Optional[str]
-    client: httpx.AsyncClient
-    user_agent: str
+    client: object  # httpx.AsyncClient or curl_cffi AsyncSession
+    user_agent: Optional[str]  # None: let curl_cffi send its matching Chrome UA
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     last_request: float = 0.0
     blocked_until: float = 0.0
@@ -123,7 +135,13 @@ class ScholarClient:
             ``block_cooldown`` seconds. ``None``/empty means direct.
         min_interval: minimum seconds between two requests on the same proxy.
         jitter: extra random delay (0..jitter seconds) added to each wait.
-        max_retries: extra attempts after a block or transient error.
+        max_retries: extra attempts after a block or transient error. After a
+            block, a retry only happens if another proxy is not benched;
+            retrying the same blocked IP right away just extends the block.
+        backend: "curl_cffi" (default when installed) sends requests with a
+            real Chrome TLS/HTTP2 fingerprint, which Google blocks far less
+            than plain Python clients. "httpx" is the plain fallback.
+        impersonate: curl_cffi browser profile, e.g. "chrome", "safari", "edge".
     """
 
     def __init__(
@@ -138,8 +156,20 @@ class ScholarClient:
         cache_ttl: float = 3600.0,
         cache_size: int = 1024,
         base_url: str = SCHOLAR_BASE,
+        backend: str = "auto",
+        impersonate: str = "chrome",
         transport: Optional[httpx.AsyncBaseTransport] = None,
     ):
+        if backend == "auto":
+            backend = "httpx" if transport is not None or CurlSession is None else "curl_cffi"
+        if backend not in ("curl_cffi", "httpx"):
+            raise ValueError(f"backend must be 'curl_cffi' or 'httpx', got {backend!r}")
+        if backend == "curl_cffi" and CurlSession is None:
+            raise ValueError("backend='curl_cffi' requires the curl_cffi package: pip install curl_cffi")
+        if backend == "curl_cffi" and transport is not None:
+            raise ValueError("transport= is only supported with backend='httpx'")
+        self.backend = backend
+        self.impersonate = impersonate
         self.base_url = base_url.rstrip("/")
         self.min_interval = min_interval
         self.jitter = jitter
@@ -162,11 +192,20 @@ class ScholarClient:
             timeout=float(os.getenv("SCHOLAR_TIMEOUT", "20")),
             block_cooldown=float(os.getenv("SCHOLAR_BLOCK_COOLDOWN", "600")),
             cache_ttl=float(os.getenv("SCHOLAR_CACHE_TTL", "3600")),
+            backend=os.getenv("SCHOLAR_HTTP_BACKEND", "auto"),
+            impersonate=os.getenv("SCHOLAR_IMPERSONATE", "chrome"),
         )
         kwargs.update(overrides)
         return cls(**kwargs)
 
     def _make_slot(self, proxy, timeout, transport) -> _Slot:
+        if self.backend == "curl_cffi":
+            # No custom headers: curl_cffi sends Chrome's own header set, and a
+            # UA that disagrees with the TLS fingerprint is itself a red flag.
+            session = CurlSession(
+                impersonate=self.impersonate, timeout=timeout, allow_redirects=True, proxy=proxy
+            )
+            return _Slot(proxy=proxy, client=session, user_agent=None)
         kwargs = dict(
             timeout=timeout,
             follow_redirects=True,
@@ -183,7 +222,14 @@ class ScholarClient:
 
     async def aclose(self) -> None:
         for slot in self._slots:
-            await slot.client.aclose()
+            if self.backend == "curl_cffi":
+                await slot.client.close()
+            else:
+                await slot.client.aclose()
+
+    def _available_slot(self) -> bool:
+        now = time.monotonic()
+        return any(slot.blocked_until <= now for slot in self._slots)
 
     def _next_slot(self) -> _Slot:
         now = time.monotonic()
@@ -221,9 +267,10 @@ class ScholarClient:
             async with slot.lock:
                 await self._wait_turn(slot)
                 slot.requests += 1
+                headers = {"User-Agent": slot.user_agent} if slot.user_agent else None
                 try:
-                    resp = await slot.client.get(url, headers={"User-Agent": slot.user_agent})
-                except httpx.HTTPError as exc:
+                    resp = await slot.client.get(url, headers=headers)
+                except self._network_errors as exc:
                     slot.errors += 1
                     slot.last_error = f"{type(exc).__name__}: {exc}"
                     last_error = ScholarError(f"network error: {exc}")
@@ -238,11 +285,17 @@ class ScholarClient:
                 slot.last_error = f"blocked (HTTP {resp.status_code})"
                 slot.blocked_until = time.monotonic() + self.block_cooldown
                 slot.client.cookies.clear()
-                slot.user_agent = random.choice(USER_AGENTS)
+                if slot.user_agent:
+                    slot.user_agent = random.choice(USER_AGENTS)
                 result.blocked_attempts += 1
                 last_error = BlockedError(
-                    f"Google Scholar returned a CAPTCHA / rate-limit page on all {result.attempts} attempt(s)."
+                    f"Google Scholar returned a CAPTCHA / rate-limit page (HTTP {resp.status_code}) "
+                    f"on all {result.attempts} attempt(s).",
+                    page=html,
+                    page_url=str(resp.url),
                 )
+                if not self._available_slot():
+                    break  # every proxy is benched; hammering the same IP extends the block
                 continue
             if resp.status_code == 404:
                 slot.errors += 1
@@ -263,9 +316,15 @@ class ScholarClient:
             return result
         raise last_error
 
+    @property
+    def _network_errors(self) -> tuple:
+        return (httpx.HTTPError,) + ((CurlError,) if CurlError is not None else ())
+
     def stats(self) -> dict:
         now = time.monotonic()
         return {
+            "http_backend": self.backend,
+            "impersonate": self.impersonate if self.backend == "curl_cffi" else None,
             "proxies": [
                 {
                     "proxy": _mask(slot.proxy) if slot.proxy else "direct",

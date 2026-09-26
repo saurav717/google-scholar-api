@@ -193,3 +193,33 @@ def test_retry_rotates_proxies():
 def test_proxy_credentials_masked():
     client = ScholarClient(proxies=["http://user:secret@proxy.example:8080"], transport=httpx.MockTransport(lambda r: None))
     assert client.stats()["proxies"][0]["proxy"] == "http://***@proxy.example:8080"
+
+
+def test_blocked_single_ip_does_not_hammer():
+    """With one IP and a real cooldown, a CAPTCHA must not trigger instant retries."""
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(429, text="Too Many Requests")
+
+    client = ScholarClient(min_interval=0, jitter=0, max_retries=3, block_cooldown=600,
+                           transport=httpx.MockTransport(handler))
+    with TestClient(create_app(client=client, api_key="")) as c:
+        r = c.get("/search.json", params={"q": "x"})
+    assert r.status_code == 503 and len(seen) == 1
+    assert "HTTP 429" in r.json()["error"]
+
+
+def test_backend_selection():
+    from scholar_api.client import CurlSession
+
+    mock = httpx.MockTransport(lambda r: httpx.Response(200))
+    assert ScholarClient(transport=mock).backend == "httpx"
+    assert ScholarClient(backend="httpx").backend == "httpx"
+    if CurlSession is not None:
+        assert ScholarClient().backend == "curl_cffi"
+        assert ScholarClient().stats()["impersonate"] == "chrome"
+    import pytest
+    with pytest.raises(ValueError):
+        ScholarClient(backend="nope")

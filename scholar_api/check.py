@@ -132,6 +132,10 @@ async def run_check(query: str, author_id: str, profile_query: str, save_dir: Pa
                 print(f"    hint: {exc.hint}")
             total_fail += 1
             kind = getattr(exc, "error_type", "")
+            if kind == "blocked" and getattr(exc, "page", ""):
+                (save_dir / "blocked.html").write_text(exc.page)
+                print(f"    blocked page: {exc.page_url}")
+                print(f"    saved to {save_dir / 'blocked.html'}")
             if kind == "blocked":
                 print("\nGoogle is blocking this IP; stopping early. Try again later or configure SCHOLAR_PROXIES.")
                 break
@@ -156,7 +160,8 @@ async def run_check(query: str, author_id: str, profile_query: str, save_dir: Pa
         if name == "google_scholar_author":
             context["citation_id"] = _get(data, "articles.0.citation_id")
 
-    print(f"\n{total_pass} required fields ok, {total_fail} missing/failed.")
+    print(f"\nHTTP backend: {client.backend}" + (f" (impersonating {client.impersonate})" if client.backend == "curl_cffi" else ""))
+    print(f"{total_pass} required fields ok, {total_fail} missing/failed.")
     print(f"Raw HTML and JSON saved in {save_dir.resolve()}")
     if total_fail:
         print("If fields are MISSING, copy the matching .html into tests/fixtures/ and fix the selector in scholar_api/parsers.py.")
