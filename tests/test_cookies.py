@@ -129,6 +129,8 @@ def test_from_env(monkeypatch, tmp_path):
     assert session == {
         "cookie_file": str(tmp_path / "c.json"),
         "warmup": False,
+        "browser": None,
+        "browser_import_error": None,
         "browser_cookies": ["GSP"],
         "ignored_browser_cookies": ["SAPISID"],
     }
@@ -138,3 +140,180 @@ def test_from_env(monkeypatch, tmp_path):
     assert ScholarClient.from_env(backend="httpx").stats()["session"]["cookie_file"].endswith(
         os.path.join(".scholar-api", "cookies.json")
     )
+
+
+# --------------------------------------------------------------------------
+# Reading cookies straight from a browser
+# --------------------------------------------------------------------------
+
+def _firefox_db(path, rows):
+    """A real Firefox cookies.sqlite (the schema browser_cookie3 reads)."""
+    import sqlite3
+
+    con = sqlite3.connect(path)
+    con.execute(
+        "CREATE TABLE moz_cookies (id INTEGER PRIMARY KEY, originAttributes TEXT DEFAULT '', name TEXT, value TEXT,"
+        " host TEXT, path TEXT, expiry INTEGER, lastAccessed INTEGER, creationTime INTEGER, isSecure INTEGER,"
+        " isHttpOnly INTEGER, inBrowserElement INTEGER DEFAULT 0, sameSite INTEGER DEFAULT 0,"
+        " rawSameSite INTEGER DEFAULT 0, schemeMap INTEGER DEFAULT 0)"
+    )
+    future = int(time.time()) + 86400
+    for name, value, host in rows:
+        con.execute(
+            "INSERT INTO moz_cookies (name, value, host, path, expiry, lastAccessed, creationTime, isSecure, isHttpOnly)"
+            " VALUES (?, ?, ?, '/', ?, 0, 0, 1, 1)",
+            (name, value, host, future),
+        )
+    con.commit()
+    con.close()
+
+
+FIREFOX_ROWS = [
+    ("NID", "nid-value", ".google.com"),
+    ("GSP", "gsp-value", "scholar.google.com"),
+    ("SID", "signin-secret", ".google.com"),
+    ("SAPISID", "signin-secret-2", ".google.com"),
+    ("__Secure-3PSID", "signin-secret-3", ".google.com"),
+    ("session", "other-site", "example.com"),
+]
+
+
+def test_read_real_firefox_cookie_store(tmp_path):
+    pytest.importorskip("browser_cookie3")
+    from scholar_api.cookies import read_browser_cookies
+
+    db = tmp_path / "cookies.sqlite"
+    _firefox_db(db, FIREFOX_ROWS)
+    kept, ignored = read_browser_cookies("firefox", cookie_file=str(db))
+    assert [(c["name"], c["value"], c["domain"]) for c in kept] == [
+        ("NID", "nid-value", ".google.com"),
+        ("GSP", "gsp-value", "scholar.google.com"),
+    ]
+    assert sorted(ignored) == ["SAPISID", "SID", "__Secure-3PSID"]
+    assert "signin-secret" not in repr(kept)
+
+
+class _FakeCookie:
+    def __init__(self, name, value, domain, expires=None):
+        self.name, self.value, self.domain, self.path, self.expires = name, value, domain, "/", expires
+
+
+def _fake_browser_module(monkeypatch, cookies, fail=None):
+    import sys
+    import types
+
+    calls = []
+
+    def loader(**kw):
+        calls.append(kw)
+        if fail:
+            raise fail
+        return list(cookies)
+
+    mod = types.SimpleNamespace(chrome=loader, load=loader, firefox=loader, safari=loader)
+    monkeypatch.setitem(sys.modules, "browser_cookie3", mod)
+    return calls
+
+
+CHROME_COOKIES = [
+    _FakeCookie("NID", "n", ".google.com"),
+    _FakeCookie("GSP", "g", "scholar.google.com"),
+    _FakeCookie("GOOGLE_ABUSE_EXEMPTION", "e", ".google.com"),
+    _FakeCookie("SID", "secret", ".google.com"),
+    _FakeCookie("NID", "stale", ".google.com", expires=1),  # expired copy ignored
+]
+
+
+def test_read_chrome_and_auto(monkeypatch):
+    from scholar_api.cookies import read_browser_cookies
+
+    calls = _fake_browser_module(monkeypatch, CHROME_COOKIES)
+    kept, ignored = read_browser_cookies("chrome")
+    assert [(c["name"], c["value"]) for c in kept] == [("NID", "n"), ("GSP", "g"), ("GOOGLE_ABUSE_EXEMPTION", "e")]
+    assert ignored == ["SID"]
+    assert calls == [{"domain_name": "google.com"}]  # only google.com is ever loaded
+    assert read_browser_cookies("auto")[0] == kept
+
+
+def test_read_browser_errors(monkeypatch):
+    from scholar_api.cookies import BrowserCookieError, read_browser_cookies
+
+    with pytest.raises(BrowserCookieError, match="Unknown browser"):
+        read_browser_cookies("netscape")
+    _fake_browser_module(monkeypatch, [], fail=PermissionError("Keychain access denied"))
+    with pytest.raises(BrowserCookieError, match="Keychain access denied"):
+        read_browser_cookies("chrome")
+    import sys
+    monkeypatch.setitem(sys.modules, "browser_cookie3", None)  # not installed
+    with pytest.raises(BrowserCookieError, match="pip install"):
+        read_browser_cookies("chrome")
+
+
+def test_client_uses_browser_cookies(monkeypatch):
+    _fake_browser_module(monkeypatch, CHROME_COOKIES)
+    seen = []
+    client = _client(_handler(seen), browser="chrome", browser_cookies="NID=pasted")
+    asyncio.run(client.get("/scholar", {"q": "x"}))
+    sent = dict(kv.split("=", 1) for kv in seen[0].headers["Cookie"].split("; "))
+    assert sent == {"NID": "pasted", "GSP": "g", "GOOGLE_ABUSE_EXEMPTION": "e"}  # pasted value wins
+    session = client.stats()["session"]
+    assert session["browser"] == "chrome" and session["browser_import_error"] is None
+    assert session["ignored_browser_cookies"] == ["SID"]
+
+
+def test_client_survives_browser_read_failure(monkeypatch):
+    _fake_browser_module(monkeypatch, [], fail=PermissionError("Keychain access denied"))
+    seen = []
+    client = _client(_handler(seen), browser="chrome")
+    asyncio.run(client.get("/scholar", {"q": "x"}))  # still works, just without those cookies
+    assert "Keychain access denied" in client.stats()["session"]["browser_import_error"]
+
+
+def test_import_cookies_command(tmp_path, capsys):
+    pytest.importorskip("browser_cookie3")
+    from unittest import mock
+
+    from scholar_api import cookies as cookies_mod
+
+    db = tmp_path / "cookies.sqlite"
+    _firefox_db(db, FIREFOX_ROWS)
+    target = tmp_path / "store" / "cookies.json"
+    target.parent.mkdir()
+    target.write_text(json.dumps({"version": 1, "slots": {"direct": [
+        {"name": "NID", "value": "old", "domain": ".google.com", "path": "/", "expires": None},
+        {"name": "1P_JAR", "value": "keep", "domain": ".google.com", "path": "/", "expires": None},
+    ]}}))
+
+    real = cookies_mod.read_browser_cookies
+    with mock.patch.object(cookies_mod, "read_browser_cookies", lambda b: real(b, cookie_file=str(db))):
+        assert cookies_mod.import_from_browser_cli("firefox", cookie_file=str(target)) == 0
+    out = capsys.readouterr().out
+    assert "Imported NID, GSP" in out and "Skipped 3 other Google cookies" in out
+
+    saved = json.loads(target.read_text())["slots"]["direct"]
+    assert {(c["name"], c["value"]) for c in saved} == {("1P_JAR", "keep"), ("NID", "nid-value"), ("GSP", "gsp-value")}
+    assert "signin-secret" not in target.read_text()
+    assert stat.S_IMODE(os.stat(target).st_mode) == 0o600
+
+    # The next run picks them up with no settings at all.
+    seen = []
+    asyncio.run(_client(_handler(seen), cookie_file=target).get("/scholar", {"q": "x"}))
+    assert "NID=nid-value" in seen[0].headers["Cookie"] and "GSP=gsp-value" in seen[0].headers["Cookie"]
+
+
+def test_import_cookies_command_nothing_found(monkeypatch, tmp_path, capsys):
+    from scholar_api.cookies import import_from_browser_cli
+
+    _fake_browser_module(monkeypatch, [_FakeCookie("SID", "s", ".google.com")])
+    target = tmp_path / "c.json"
+    assert import_from_browser_cli("chrome", cookie_file=str(target)) == 1
+    assert "No Scholar cookies found" in capsys.readouterr().out
+    assert not target.exists()
+
+
+def test_garbled_browser_values_rejected(monkeypatch):
+    from scholar_api.cookies import BrowserCookieError, read_browser_cookies
+
+    _fake_browser_module(monkeypatch, [_FakeCookie("NID", "\x8f\x02garbage\x00", ".google.com")])
+    with pytest.raises(BrowserCookieError, match="could not be decrypted"):
+        read_browser_cookies("chrome")

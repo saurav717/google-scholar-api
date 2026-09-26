@@ -16,8 +16,25 @@ def main() -> None:
     check.add_argument("--author-id", default="JicYPdAAAAAJ", help="author profile to test with")
     check.add_argument("--profiles", default="geoffrey hinton", help="author search to test with")
     check.add_argument("--save-dir", default="scholar-check", help="where to save raw HTML/JSON")
+    check.add_argument("--browser", help="also use Scholar cookies from this browser (chrome, firefox, safari, ..., auto)")
+
+    imp = sub.add_parser(
+        "import-cookies",
+        help="copy Scholar's cookies from your browser into the scraper's cookie file",
+        description=(
+            "Reads NID, GSP and GOOGLE_ABUSE_EXEMPTION for google.com from a local browser and saves "
+            "them to the scraper's cookie file, so every later run uses them automatically. "
+            "Google sign-in cookies are never read into the file."
+        ),
+    )
+    imp.add_argument("--browser", default="chrome", help="chrome (default), firefox, safari, edge, brave, chromium, opera, vivaldi, or auto")
 
     args = parser.parse_args()
+    if args.command == "import-cookies":
+        from .cookies import import_from_browser_cli
+
+        sys.exit(import_from_browser_cli(args.browser))
+
     if args.command == "check":
         from .check import main as check_main
 

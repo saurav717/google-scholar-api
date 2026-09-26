@@ -23,7 +23,7 @@ cd google-scholar-api
 python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 python -m pip install --upgrade pip   # pip older than 21.3 can't do editable installs
-pip install -e ".[dev]"
+pip install -e ".[dev]"               # dev includes the optional browser-cookie reader
 ```
 
 **Using Anaconda?** Its `base` Python may be too old, and `base`'s own `pytest` can
@@ -44,7 +44,7 @@ Always run tests with `python -m pytest` so they use this environment's Python.
 python -m pytest -v
 ```
 
-This runs 51 tests against saved Scholar pages in `tests/fixtures/`. They cover every
+This runs 59 tests against saved Scholar pages in `tests/fixtures/`. They cover every
 parser, every endpoint, caching, retries, CAPTCHA handling, proxy rotation and a full
 end-to-end run over real HTTP. They should all pass on a fresh clone.
 
@@ -213,6 +213,7 @@ asyncio.run(main())
 | `SCHOLAR_COOKIE_FILE` | `~/.scholar-api/cookies.json` | Where Google's cookies are kept between runs (file mode 0600). `none` disables it |
 | `SCHOLAR_WARMUP` | `1` | Visit the Scholar homepage once per connection before the first query. `0` turns it off |
 | `SCHOLAR_COOKIES` | *(none)* | Cookies copied from your browser. See [Using your browser's cookies](#using-your-browsers-cookies) |
+| `SCHOLAR_BROWSER` | *(none)* | Read Scholar's cookies from this browser each time the scraper starts: `chrome`, `firefox`, `safari`, `edge`, `brave`, … or `auto` |
 | `HOST` / `PORT` | `127.0.0.1` / `8000` | Server bind address |
 
 Run **one worker process**, because the rate limiter and cache live in memory.
@@ -248,7 +249,25 @@ page to `scholar-check/blocked.html`. `GET /status` shows which proxies are gett
 ### Using your browser's cookies
 
 If Scholar opens fine in your browser but the scraper is blocked, you can let the scraper
-reuse your browser's standing with Scholar:
+reuse your browser's standing with Scholar.
+
+**Automatically (recommended):**
+
+```bash
+scholar-api import-cookies                    # reads Chrome; or --browser firefox / safari / edge / brave / auto
+```
+
+This reads `NID`, `GSP` and `GOOGLE_ABUSE_EXEMPTION` for google.com from your browser and
+saves them to `~/.scholar-api/cookies.json`. Every later run uses them, with no settings
+needed. On macOS, Chrome, Edge and Brave ask once for your login (Keychain) password to
+unlock their cookie store; click **Allow**. Safari needs Full Disk Access for your
+terminal app. Re-run the command if blocks come back.
+
+To re-read the browser's cookies every time the scraper starts, set
+`SCHOLAR_BROWSER=chrome` (or pass `scholar-api check --browser chrome`). `GET /status`
+shows the browser in use and any error reading it.
+
+**By hand:**
 
 1. Open https://scholar.google.com in Chrome, and solve a CAPTCHA if one appears.
 2. Open DevTools (`Cmd+Option+I` on a Mac, `F12` on Windows) → **Application** →
@@ -262,7 +281,7 @@ reuse your browser's standing with Scholar:
    scholar-api check        # or: scholar-api serve
    ```
 
-Only `NID`, `GSP` and `GOOGLE_ABUSE_EXEMPTION` are ever used. Anything else you paste,
+Either way, only `NID`, `GSP` and `GOOGLE_ABUSE_EXEMPTION` are ever used. Anything else you paste,
 including Google sign-in cookies such as `SID` or `SAPISID`, is dropped and listed under
 "ignored", so your Google account is never involved. These cookies expire, so refresh
 them if blocks come back. `GET /status` shows which cookies are in use.
