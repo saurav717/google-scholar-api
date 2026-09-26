@@ -16,6 +16,14 @@ from typing import Optional
 import httpx
 
 from . import parsers
+from .cookies import (
+    CookieStore,
+    default_cookie_file,
+    export_jar,
+    import_cookies,
+    parse_browser_cookies,
+    slot_key,
+)
 
 try:  # Chrome-impersonating HTTP client; plain httpx gets 429'd by Google quickly.
     from curl_cffi import CurlError
@@ -92,6 +100,9 @@ class _Slot:
     proxy: Optional[str]
     client: object  # httpx.AsyncClient or curl_cffi AsyncSession
     user_agent: Optional[str]  # None: let curl_cffi send its matching Chrome UA
+    key: str = "direct"
+    warmed: bool = False
+    warmups: int = 0
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     last_request: float = 0.0
     blocked_until: float = 0.0
@@ -148,6 +159,14 @@ class ScholarClient:
             real Chrome TLS/HTTP2 fingerprint, which Google blocks far less
             than plain Python clients. "httpx" is the plain fallback.
         impersonate: curl_cffi browser profile, e.g. "chrome", "safari", "edge".
+        cookie_file: JSON file where Google's cookies are kept between runs, so
+            the scraper looks like a returning visitor. None = don't persist.
+        browser_cookies: a Cookie header copied from your browser. Only NID,
+            GSP and GOOGLE_ABUSE_EXEMPTION are used; everything else (including
+            Google sign-in cookies) is dropped.
+        warmup: visit the Scholar homepage once per connection before the first
+            query, like a person opening the site. Defaults to on, except when a
+            test ``transport`` is given.
     """
 
     def __init__(
@@ -164,6 +183,9 @@ class ScholarClient:
         base_url: str = SCHOLAR_BASE,
         backend: str = "auto",
         impersonate: str = "chrome",
+        cookie_file: Optional[str] = None,
+        browser_cookies: Optional[str] = None,
+        warmup: Optional[bool] = None,
         transport: Optional[httpx.AsyncBaseTransport] = None,
     ):
         if backend == "auto":
@@ -182,6 +204,10 @@ class ScholarClient:
         self.max_retries = max_retries
         self.block_cooldown = block_cooldown
         self.cache = TTLCache(cache_ttl, cache_size)
+        self.warmup = (transport is None) if warmup is None else warmup
+        self.cookie_store = CookieStore(cookie_file) if cookie_file else None
+        self._saved_cookies = self.cookie_store.load() if self.cookie_store else {}
+        self.browser_cookies, self.ignored_browser_cookies = parse_browser_cookies(browser_cookies or "")
         self._slots = [
             self._make_slot(proxy, timeout, transport) for proxy in (proxies or [None])
         ]
@@ -200,11 +226,22 @@ class ScholarClient:
             cache_ttl=float(os.getenv("SCHOLAR_CACHE_TTL", "3600")),
             backend=os.getenv("SCHOLAR_HTTP_BACKEND", "auto"),
             impersonate=os.getenv("SCHOLAR_IMPERSONATE", "chrome"),
+            cookie_file=_cookie_file_from_env(),
+            browser_cookies=os.getenv("SCHOLAR_COOKIES") or None,
+            warmup=os.getenv("SCHOLAR_WARMUP", "1").lower() not in ("0", "false", "no", "off"),
         )
         kwargs.update(overrides)
         return cls(**kwargs)
 
     def _make_slot(self, proxy, timeout, transport) -> _Slot:
+        slot = self._new_slot(proxy, timeout, transport)
+        slot.key = slot_key(proxy)
+        slot.warmed = not self.warmup
+        import_cookies(slot.client.cookies, self._saved_cookies.get(slot.key, []))
+        import_cookies(slot.client.cookies, self.browser_cookies)  # explicit cookies win
+        return slot
+
+    def _new_slot(self, proxy, timeout, transport) -> _Slot:
         if self.backend == "curl_cffi":
             # No custom headers: curl_cffi sends Chrome's own header set, and a
             # UA that disagrees with the TLS fingerprint is itself a red flag.
@@ -232,6 +269,32 @@ class ScholarClient:
                 await slot.client.close()
             else:
                 await slot.client.aclose()
+
+    def _save_cookies(self) -> None:
+        if self.cookie_store is None:
+            return
+        slots = dict(self._saved_cookies)
+        for slot in self._slots:
+            slots[slot.key] = export_jar(slot.client.cookies)
+        self._saved_cookies = slots
+        try:
+            self.cookie_store.save(slots)
+        except OSError:
+            pass  # persistence is best-effort
+
+    async def _warm_up(self, slot: _Slot) -> None:
+        """Open the Scholar homepage once, like a person would, to collect
+        cookies before the first query. Failures are ignored: a block here
+        shows up on the real request."""
+        slot.warmed = True
+        await self._wait_turn(slot)
+        slot.requests += 1
+        slot.warmups += 1
+        headers = {"User-Agent": slot.user_agent} if slot.user_agent else None
+        try:
+            await slot.client.get(self.base_url + "/?hl=en", headers=headers)
+        except self._network_errors:
+            pass
 
     def _available_slot(self) -> bool:
         now = time.monotonic()
@@ -271,6 +334,8 @@ class ScholarClient:
             slot = self._next_slot()
             result.attempts += 1
             async with slot.lock:
+                if not slot.warmed:
+                    await self._warm_up(slot)
                 await self._wait_turn(slot)
                 slot.requests += 1
                 headers = {"User-Agent": slot.user_agent} if slot.user_agent else None
@@ -291,6 +356,8 @@ class ScholarClient:
                 slot.last_error = f"blocked (HTTP {resp.status_code})"
                 slot.blocked_until = time.monotonic() + self.block_cooldown
                 slot.client.cookies.clear()
+                import_cookies(slot.client.cookies, self.browser_cookies)
+                self._save_cookies()
                 if slot.user_agent:
                     slot.user_agent = random.choice(USER_AGENTS)
                 result.blocked_attempts += 1
@@ -320,6 +387,7 @@ class ScholarClient:
                 raise ScholarError(f"Google Scholar returned HTTP {resp.status_code}")
 
             slot.successes += 1
+            self._save_cookies()
             self.cache.set(url, html)
             result.html, result.url = html, url
             return result
@@ -343,6 +411,9 @@ class ScholarClient:
                     "errors": slot.errors,
                     "benched_for_seconds": max(0, round(slot.blocked_until - now)),
                     "last_error": slot.last_error,
+                    "warmed_up": slot.warmed,
+                    "warmup_requests": slot.warmups,
+                    "cookies": sorted({c.name for c in slot.client.cookies.jar}),
                 }
                 for slot in self._slots
             ],
@@ -353,6 +424,12 @@ class ScholarClient:
                 "hits": self.cache.hits,
                 "misses": self.cache.misses,
             },
+            "session": {
+                "cookie_file": str(self.cookie_store.path) if self.cookie_store else None,
+                "warmup": self.warmup,
+                "browser_cookies": [c["name"] for c in self.browser_cookies],
+                "ignored_browser_cookies": self.ignored_browser_cookies,
+            },
             "pacing": {
                 "min_interval_seconds": self.min_interval,
                 "jitter_seconds": self.jitter,
@@ -360,6 +437,13 @@ class ScholarClient:
                 "block_cooldown_seconds": self.block_cooldown,
             },
         }
+
+
+def _cookie_file_from_env() -> Optional[str]:
+    value = os.getenv("SCHOLAR_COOKIE_FILE")
+    if value is None:
+        return str(default_cookie_file())
+    return None if value.strip().lower() in ("", "0", "none", "off") else value
 
 
 def _mask(proxy: str) -> str:

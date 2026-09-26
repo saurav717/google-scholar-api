@@ -162,6 +162,14 @@ async def run_check(query: str, author_id: str, profile_query: str, save_dir: Pa
             context["citation_id"] = _get(data, "articles.0.citation_id")
 
     print(f"\nHTTP backend: {client.backend}" + (f" (impersonating {client.impersonate})" if client.backend == "curl_cffi" else ""))
+    session = client.stats()["session"]
+    cookies = sorted({name for slot in client.stats()["proxies"] for name in slot["cookies"]})
+    print(f"Cookies held: {', '.join(cookies) or 'none'}"
+          + (f" (saved to {session['cookie_file']})" if session["cookie_file"] else " (not persisted)"))
+    if session["browser_cookies"]:
+        print(f"Using your browser cookies: {', '.join(session['browser_cookies'])}")
+    if session["ignored_browser_cookies"]:
+        print(f"Ignored browser cookies (not needed / sign-in): {', '.join(session['ignored_browser_cookies'])}")
     print(f"{total_pass} required fields ok, {total_fail} missing/failed.")
     print(f"Raw HTML and JSON saved in {save_dir.resolve()}")
     if total_fail:
